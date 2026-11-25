@@ -112,13 +112,25 @@ models/paper1_mappo/
 logs/paper1_mappo/
 
 # =============================================================================
-# Scaled networks (N1/N2/N3): commit topology + lane_groups + sumocfgs;
-# demand regenerates deterministically via scripts/generate_demand.py --seed
-# (same convention as sumo_configs/evaluation above). tls_actuated.add.xml
-# is rebuilt at runtime by experiment/baselines/actuated.py.
+# Scaled networks (N1/N2/N3/N4): commit topology + lane_groups + sumocfgs +
+# canonical train/eval demand files for n2_corridor, n3_grid, n4_irregular
+# (deterministic and byte-reproducible via scripts/generate_demand.py --seed 42;
+# keeping OOD/moto sweeps and runtime tls_actuated.add.xml ignored).
 # =============================================================================
 sumo_configs/networks/*/demand_*.rou.xml
 sumo_configs/networks/*/demand_*.trips.xml
+!sumo_configs/networks/n2_corridor/demand_train.rou.xml
+!sumo_configs/networks/n2_corridor/demand_eval.rou.xml
+!sumo_configs/networks/n2_corridor/demand_train.trips.xml
+!sumo_configs/networks/n2_corridor/demand_eval.trips.xml
+!sumo_configs/networks/n3_grid/demand_train.rou.xml
+!sumo_configs/networks/n3_grid/demand_eval.rou.xml
+!sumo_configs/networks/n3_grid/demand_train.trips.xml
+!sumo_configs/networks/n3_grid/demand_eval.trips.xml
+!sumo_configs/networks/n4_irregular/demand_train.rou.xml
+!sumo_configs/networks/n4_irregular/demand_eval.rou.xml
+!sumo_configs/networks/n4_irregular/demand_train.trips.xml
+!sumo_configs/networks/n4_irregular/demand_eval.trips.xml
 sumo_configs/networks/*/tls_actuated.add.xml
 
 # =============================================================================

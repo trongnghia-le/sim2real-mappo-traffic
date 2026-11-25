@@ -43,6 +43,83 @@ from src.traffic_env.config import (
 LaneMetrics = Dict[str, float]
 ObsDict = Dict[str, np.ndarray]
 
+_COUNT_WEIGHTED_FEATURES: frozenset = frozenset(
+    {"avg_speed_norm", "motorbike_share", "heavy_vehicle_share"}
+)
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def group_lanes_by_approach(
+    lane_ids: Sequence[str],
+    *,
+    external_state: bool = False,
+) -> List[Tuple[str, List[str]]]:
+    """Group controlled lane IDs into approaches, one group per incoming edge.
+
+    SUMO lane ids follow '<edge_id>_<lane_index>'; lanes sharing a parent
+    edge form one approach. In external/vision mode each cache key is
+    already an approach-level ROI, so every id maps to its own group.
+    """
+    unique_ids = list(dict.fromkeys(lane_ids))
+    if external_state:
+        return [(lane_id, [lane_id]) for lane_id in unique_ids]
+
+    groups: Dict[str, List[str]] = {}
+    order: List[str] = []
+    for lane_id in unique_ids:
+        edge_key = lane_id.rsplit("_", 1)[0] if "_" in lane_id else lane_id
+        if edge_key not in groups:
+            groups[edge_key] = []
+            order.append(edge_key)
+        groups[edge_key].append(lane_id)
+    return [(edge_key, groups[edge_key]) for edge_key in order]
+
+
+def aggregate_approach_metrics(
+    lane_ids: Sequence[str],
+    lane_cache: Mapping[str, Mapping[str, Any]],
+    feature_names: Sequence[str] = DEFAULT_LANE_FEATURE_NAMES,
+) -> Dict[str, float]:
+    """Aggregate per-lane metrics into one approach-level feature set.
+
+    Queue/occupancy are length-ratio features -> unweighted mean across lanes.
+    Speed and class shares are per-vehicle statistics -> vehicle-count-weighted
+    mean, so empty lanes do not dilute them.
+    """
+    if not lane_ids:
+        return {name: 0.0 for name in feature_names}
+    if len(lane_ids) == 1:
+        metrics = lane_cache.get(lane_ids[0], {})
+        return {
+            name: _to_float(metrics.get(name, 0.0))
+            for name in feature_names
+        }
+
+    per_lane = [lane_cache.get(lane_id, {}) for lane_id in lane_ids]
+    counts = [
+        max(_to_float(m.get("raw_vehicle_count", 0.0)), 0.0)
+        for m in per_lane
+    ]
+    total_count = sum(counts)
+
+    agg: Dict[str, float] = {}
+    for name in feature_names:
+        vals = [_to_float(m.get(name, 0.0)) for m in per_lane]
+        if name in _COUNT_WEIGHTED_FEATURES and total_count > 0:
+            value = sum(v * c for v, c in zip(vals, counts)) / total_count
+        else:
+            value = float(np.mean(vals))
+        agg[name] = float(np.clip(value, 0.0, 1.0))
+    return agg
+
 
 # ---------------------------------------------------------------------------
 # Vision adapter
@@ -199,6 +276,9 @@ class ObservationBuilder:
     _lane_length_cache: Dict[str, float] = field(default_factory=dict, init=False)
     # W5-9: emit PRIVILEGED_EXTRA_LANE_FEATURE_NAMES from exact SUMO state
     _privileged: bool = field(default=False, init=False)
+    # A5: populate privileged_* keys in lane_cache for privileged-reward arm
+    # even when obs_mode="proxy" (never enters the 26-dim obs vector).
+    _collect_privileged_metrics: bool = field(default=False, init=False)
     # VI-F ablation: reproduce the pre-S1 blind-spot obs (raw lanes, no approach aggregation)
     _lane_truncated: bool = field(default=False, init=False)
     # corridor coordination: emit UPSTREAM_PHASE_FEATURE_NAMES (mean phase one-hot
@@ -221,6 +301,9 @@ class ObservationBuilder:
         }
         self._external_lane_cache = None
         self._privileged = self.config.observation.obs_mode == "privileged"
+        self._collect_privileged_metrics = (
+            self._privileged or bool(self.config.reward.privileged_reward)
+        )
         self._lane_truncated = bool(getattr(self.config.observation, "lane_truncated", False))
         self._upstream_phase_obs = any(
             name.startswith("upstream_phase_one_hot") for name in self._tls_feature_names
@@ -405,10 +488,10 @@ class ObservationBuilder:
             "lane_length": float(lane_length),
             "co2_mg_per_s": float(co2_total),
             "fuel_ml_per_s": float(fuel_total),
-            # 1.2.0: consumed by RewardCalculator local throughput (training only)
+            # 1.3.0: consumed by RewardCalculator local approach-exit throughput (training only)
             "vehicle_ids": tuple(str(v) for v in vehicle_ids),
         }
-        if self._privileged:
+        if self._collect_privileged_metrics:
             metrics.update(
                 self._privileged_lane_features(lane_id, halted_count, vehicle_count)
             )
@@ -546,60 +629,22 @@ class ObservationBuilder:
         """
         lane_ids = self._safe_lane_ids_for_tls(tls_id)
         if self.config.observation.use_external_state and self._external_lane_cache is not None:
-            return [(lane_id, [lane_id]) for lane_id in lane_ids]
+            return group_lanes_by_approach(lane_ids, external_state=True)
 
         # VI-F blind-spot ablation: raw lanes as individual slots (no approach
         # aggregation), so build_local_obs sees only the first max_lanes lanes.
         if self._lane_truncated:
             return [(lane_id, [lane_id]) for lane_id in lane_ids[: self.config.max_lanes_per_tls]]
 
-        groups: Dict[str, List[str]] = {}
-        order: List[str] = []
-        for lane_id in lane_ids:
-            edge_key = lane_id.rsplit("_", 1)[0] if "_" in lane_id else lane_id
-            if edge_key not in groups:
-                groups[edge_key] = []
-                order.append(edge_key)
-            groups[edge_key].append(lane_id)
-        return [(edge_key, groups[edge_key]) for edge_key in order]
+        return group_lanes_by_approach(lane_ids, external_state=False)
 
     def _aggregate_approach_metrics(
         self,
         lane_ids: Sequence[str],
         lane_cache: Mapping[str, Mapping[str, float]],
     ) -> Dict[str, float]:
-        """aggregate per-lane metrics into one approach-level feature set.
-
-        queue/occupancy are length-ratio features -> unweighted mean across
-        lanes. speed and class shares are per-vehicle statistics -> vehicle-
-        count-weighted mean, so empty lanes do not dilute them.
-        """
-        if not lane_ids:
-            return {name: 0.0 for name in self._lane_feature_names}
-        if len(lane_ids) == 1:
-            metrics = lane_cache.get(lane_ids[0], {})
-            return {
-                name: self._safe_float(metrics.get(name, 0.0))
-                for name in self._lane_feature_names
-            }
-
-        per_lane = [lane_cache.get(lane_id, {}) for lane_id in lane_ids]
-        counts = [
-            max(self._safe_float(m.get("raw_vehicle_count", 0.0)), 0.0)
-            for m in per_lane
-        ]
-        total_count = sum(counts)
-        count_weighted = {"avg_speed_norm", "motorbike_share", "heavy_vehicle_share"}
-
-        agg: Dict[str, float] = {}
-        for name in self._lane_feature_names:
-            vals = [self._safe_float(m.get(name, 0.0)) for m in per_lane]
-            if name in count_weighted and total_count > 0:
-                value = sum(v * c for v, c in zip(vals, counts)) / total_count
-            else:
-                value = float(np.mean(vals))
-            agg[name] = self._clamp01(value)
-        return agg
+        """aggregate per-lane metrics into one approach-level feature set."""
+        return aggregate_approach_metrics(lane_ids, lane_cache, self._lane_feature_names)
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -928,10 +973,10 @@ class ObservationBuilder:
             "lane_length": float(lane_length),
             "co2_mg_per_s": float(co2_total),
             "fuel_ml_per_s": float(fuel_total),
-            # 1.2.0: consumed by RewardCalculator local throughput (training only)
+            # 1.3.0: consumed by RewardCalculator local approach-exit throughput (training only)
             "vehicle_ids": tuple(str(v) for v in vehicle_ids),
         }
-        if self._privileged:
+        if self._collect_privileged_metrics:
             metrics.update(
                 self._privileged_lane_features(lane_id, halted_count, vehicle_count)
             )
@@ -1003,4 +1048,11 @@ class ObservationBuilder:
         return features
 
 
-__all__ = ["ObservationBuilder", "VisionLaneMetrics", "LaneMetrics", "ObsDict"]
+__all__ = [
+    "ObservationBuilder",
+    "VisionLaneMetrics",
+    "LaneMetrics",
+    "ObsDict",
+    "group_lanes_by_approach",
+    "aggregate_approach_metrics",
+]

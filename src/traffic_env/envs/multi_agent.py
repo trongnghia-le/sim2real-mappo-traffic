@@ -29,6 +29,39 @@ DoneDict = Dict[str, bool]
 InfoDict = Dict[str, Dict[str, Any]]
 
 
+class GreenDurationRecord(tuple):
+    """Realized green-phase record: 3-tuple ``(tls_id, phase, duration_s)`` with ``.completed``.
+
+    Preserves 3-tuple unpacking and equality for backward compatibility while
+    tagging whether the phase ended via a normal switch (``completed=True``) or
+    was right-censored at episode end (``completed=False``).
+    """
+
+    completed: bool
+
+    def __new__(
+        cls,
+        tls_id: str,
+        phase: int,
+        duration_s: float,
+        completed: bool = True,
+    ) -> "GreenDurationRecord":
+        obj = super().__new__(cls, (str(tls_id), int(phase), float(duration_s)))
+        obj.completed = bool(completed)
+        return obj
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, GreenDurationRecord):
+            return super().__eq__(other) and self.completed == other.completed
+        return super().__eq__(other)
+
+    def __repr__(self) -> str:
+        return (
+            f"GreenDurationRecord({self[0]!r}, {self[1]!r}, "
+            f"{self[2]!r}, completed={self.completed!r})"
+        )
+
+
 class MappoTrafficEnv(BaseSumoEnv):
 
     def __init__(
@@ -51,6 +84,11 @@ class MappoTrafficEnv(BaseSumoEnv):
 
         self.green_timers = {tls_id: 0.0 for tls_id in self.tls_ids}
         self.last_actions = {tls_id: 0 for tls_id in self.tls_ids}
+        # realized green-phase durations: GreenDurationRecord(tls_id, phase, duration_s, completed=...)
+        self.green_durations: List[GreenDurationRecord] = []
+        self._phase_elapsed_s: Dict[str, float] = {tls_id: 0.0 for tls_id in self.tls_ids}
+        self._current_green_phase: Dict[str, int] = {tls_id: 0 for tls_id in self.tls_ids}
+        self._green_durations_flushed: bool = False
 
         # dynamic phase maps (auto-detect on reset)
         self._green_phase_map: Dict[str, List[int]] = {}
@@ -72,6 +110,9 @@ class MappoTrafficEnv(BaseSumoEnv):
 
         self.green_timers = {tls_id: 0.0 for tls_id in self.tls_ids}
         self.last_actions = {tls_id: 0 for tls_id in self.tls_ids}
+        self.green_durations = []
+        self._phase_elapsed_s = {tls_id: 0.0 for tls_id in self.tls_ids}
+        self._green_durations_flushed = False
         self.reward_calculator.reset()
         self._step_count = 0
 
@@ -83,7 +124,14 @@ class MappoTrafficEnv(BaseSumoEnv):
             first_tls = self.tls_ids[0]
             self.action_dim = len(self._green_phase_map.get(first_tls, [0, 2]))
 
-        self.sim_step(1)
+        # Keep SUMO at t=0.0 s to match green_timers=0.0 and _phase_elapsed_s=0.0
+        # (avoids running 1 extra uncounted sim second on the initial phase and
+        # keeps total episode duration equal to max_steps * step_length).
+        self._current_green_phase = {}
+        for tls_id in self.tls_ids:
+            cur = self._get_phase(tls_id)
+            phase_map = self._green_phase_map.get(tls_id, [0, 2])
+            self._current_green_phase[tls_id] = cur if cur in phase_map else phase_map[0]
 
         lane_cache = self.obs_builder.build_lane_cache(self.tls_ids)
         obs_dict, global_state = self.obs_builder.get_all_observations(
@@ -112,15 +160,31 @@ class MappoTrafficEnv(BaseSumoEnv):
         # -----------------------------------------
         # 1. ACTION → GREEN PHASE
         # -----------------------------------------
+        max_green = float(self.config.sim.max_green_time)
+        step_len = float(self.config.sim.step_length)
         for tls_id, action in action_dict.items():
             current = self._get_phase(tls_id)
+            phase_map = self._green_phase_map[tls_id]
 
             action_idx = int(action)
-            action_idx = max(0, min(action_idx, len(self._green_phase_map[tls_id]) - 1))
-            target = self._green_phase_map[tls_id][action_idx]
+            action_idx = max(0, min(action_idx, len(phase_map) - 1))
+            target = phase_map[action_idx]
 
-            # enforce min green time
-            if target != current and self.green_timers[tls_id] < self.config.sim.min_green_time:
+            # enforce max green time: force switch if holding another full step
+            # would push realized green past max_green_time (after a switch step,
+            # the new green starts at remaining = step_length - yellow_time = 2 s,
+            # so 2 + 11*5 = 57 s is the last legal hold before 62 s > 60 s).
+            would_exceed_max = (self.green_timers[tls_id] + step_len) > (max_green + 1e-9)
+            if target == current and would_exceed_max and len(phase_map) >= 2:
+                next_idx = (phase_map.index(current) + 1) % len(phase_map)
+                target = phase_map[next_idx]
+                switches[tls_id] = True
+            # enforce min green time (never forcing a hold that violates max_green_time)
+            elif (
+                target != current
+                and self.green_timers[tls_id] < self.config.sim.min_green_time
+                and not would_exceed_max
+            ):
                 target = current
                 switches[tls_id] = False
             else:
@@ -158,19 +222,32 @@ class MappoTrafficEnv(BaseSumoEnv):
             self.sim_step(remaining)
 
         # -----------------------------------------
-        # 4. UPDATE TIMERS  (FIX: cap at max_green_time)
+        # 4. UPDATE TIMERS + REALIZED GREEN DURATIONS
         # -----------------------------------------
         max_green = float(self.config.sim.max_green_time)
+        step_len = float(self.config.sim.step_length)
         for tls_id in self.tls_ids:
             if switches.get(tls_id, False):
+                ended_dur = float(self._phase_elapsed_s.get(tls_id, 0.0))
+                if ended_dur > 0.0:
+                    prev_phase = self._current_green_phase.get(tls_id, 0)
+                    self.green_durations.append(
+                        GreenDurationRecord(tls_id, int(prev_phase), ended_dur, completed=True)
+                    )
+                self._current_green_phase[tls_id] = int(target_phases[tls_id])
+                self._phase_elapsed_s[tls_id] = float(max(remaining, 0))
                 self.green_timers[tls_id] = float(max(remaining, 0))
             else:
+                self._phase_elapsed_s[tls_id] = self._phase_elapsed_s.get(tls_id, 0.0) + step_len
                 self.green_timers[tls_id] = min(
-                    self.green_timers[tls_id] + float(self.config.sim.step_length),
+                    self.green_timers[tls_id] + step_len,
                     max_green,
                 )
 
             self.last_actions[tls_id] = int(action_dict.get(tls_id, 0))
+
+        if is_done:
+            self._flush_green_durations()
 
         # -----------------------------------------
         # 5. OBS
@@ -316,6 +393,23 @@ class MappoTrafficEnv(BaseSumoEnv):
         # lanes (reward and observation used different lane multisets).
         return [l for l in dict.fromkeys(lanes) if l and not str(l).startswith(":")]
 
+    def _flush_green_durations(self) -> None:
+        """Append currently running green phases at episode end (idempotent, completed=False)."""
+        if self._green_durations_flushed:
+            return
+        self._green_durations_flushed = True
+        for tls_id in self.tls_ids:
+            dur = float(self._phase_elapsed_s.get(tls_id, 0.0))
+            if dur > 0.0:
+                phase = self._current_green_phase.get(tls_id, 0)
+                self.green_durations.append(
+                    GreenDurationRecord(tls_id, int(phase), dur, completed=False)
+                )
+
+    def close(self) -> None:
+        self._flush_green_durations()
+        super().close()
+
     def _get_total_passed(self) -> float:
         # cumulative arrivals since episode start (base_sumo sums the per-step
         # simulation.getArrivedNumber()). Returning the raw per-step value here
@@ -323,4 +417,4 @@ class MappoTrafficEnv(BaseSumoEnv):
         return float(self.arrived_cumulative)
 
 
-__all__ = ["MappoTrafficEnv"]
+__all__ = ["GreenDurationRecord", "MappoTrafficEnv"]

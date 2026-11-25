@@ -105,22 +105,31 @@ METHOD_LABELS: Dict[str, str] = {
     "ippo": "IPPO (proxy)",
     "webster": "Webster",
     "actuated": "Actuated",
-    "maxpressure": "MaxPressure",
+    "lqi": "LQI",
+    "mp": "Max-Pressure",
+    "maxpressure": "LQI",  # legacy key
     "sotl": "SOTL",
     "fixed": "Fixed-Time",
 }
 METHOD_GROUP: Dict[str, Tuple[str, str]] = {
-    "mappo": ("MAPPO", "proxy"),
-    "privileged": ("MAPPO", "privileged"),
-    "ippo": ("IPPO", "proxy"),
+    "mappo": ("MAPPO", "camera (proxy)"),
+    "privileged": ("MAPPO", "instrumented (privileged)"),
+    "ippo": ("IPPO", "camera (proxy)"),
+    "webster": ("classical", "camera"),
+    "lqi": ("classical", "camera"),
+    "maxpressure": ("classical", "camera"),
+    "sotl": ("classical", "camera"),
+    "fixed": ("classical", "camera"),
+    "actuated": ("classical", "instrumented"),
+    "mp": ("classical", "instrumented"),
 }
 METHOD_ORDER: Tuple[str, ...] = (
-    "mappo", "privileged", "ippo",
-    "webster", "actuated", "maxpressure", "sotl", "fixed",
+    "mappo", "ippo", "webster", "lqi", "maxpressure", "sotl", "fixed",
+    "privileged", "actuated", "mp",
 )
 LEARNED_METHODS = {"mappo", "privileged", "ippo"}
 REFERENCE_METHOD = "mappo"        # MAPPO-proxy = the deployable headline policy
-SIG_COMPARATOR = "maxpressure"    # the strongest classical baseline (Reviewer Q5)
+SIG_COMPARATOR = "lqi"            # strongest camera-deployable classical baseline (legacy: maxpressure)
 
 
 # --------------------------------------------------------------------------- #
@@ -267,17 +276,56 @@ def discover_noise_sweep(results_dir: Path) -> Optional[dict]:
     return {"data": data, "dir": summaries[-1].parent}
 
 
+def _load_campaign_dir(camp_dir: Path) -> Optional[dict]:
+    """Load campaign_manifest.json or merge per-shard manifests in ``camp_dir``."""
+    single = camp_dir / "campaign_manifest.json"
+    if single.exists():
+        data = load_json(single)
+        return {"data": data, "dir": camp_dir} if data else None
+    shards = sorted(camp_dir.glob("campaign_manifest_shard*of*.json"))
+    if not shards:
+        return None
+    merged_jobs: List[dict] = []
+    merged_counts: Dict[str, int] = {}
+    updated_at = ""
+    for sp in shards:
+        d = load_json(sp)
+        if not d:
+            continue
+        merged_jobs.extend(d.get("jobs", []))
+        for k, v in (d.get("counts") or {}).items():
+            merged_counts[k] = merged_counts.get(k, 0) + int(v or 0)
+        ts = str(d.get("updated_at") or "")
+        if ts > updated_at:
+            updated_at = ts
+    if not merged_jobs:
+        return None
+    return {
+        "data": {
+            "campaign_dir": str(camp_dir),
+            "updated_at": updated_at,
+            "counts": merged_counts,
+            "jobs": merged_jobs,
+            "shards": [sp.name for sp in shards],
+        },
+        "dir": camp_dir,
+    }
+
+
 def discover_campaign(results_dir: Path, campaign_id: Optional[str]) -> Optional[dict]:
     if campaign_id:
-        path = results_dir / campaign_id / "campaign_manifest.json"
-        data = load_json(path)
-        return {"data": data, "dir": path.parent} if data else None
-    manifests = sorted(results_dir.glob("campaign_*/campaign_manifest.json"),
-                       key=lambda p: _ts_key(p.parent))
-    if not manifests:
+        return _load_campaign_dir(results_dir / campaign_id)
+    cand_dirs = sorted(
+        {
+            p.parent
+            for pat in ("campaign_*/campaign_manifest.json", "campaign_*/campaign_manifest_shard*of*.json")
+            for p in results_dir.glob(pat)
+        },
+        key=_ts_key,
+    )
+    if not cand_dirs:
         return None
-    data = load_json(manifests[-1])
-    return {"data": data, "dir": manifests[-1].parent} if data else None
+    return _load_campaign_dir(cand_dirs[-1])
 
 
 def discover_pilots(results_dir: Path) -> List[dict]:
@@ -366,7 +414,9 @@ def render_significance(aggregates: dict, harness_stats: dict,
     ref_n = max((int(agg_cell(aggregates, reference, m).get("n", 0) or 0)
                  for m in PRIMARY_METRICS), default=0)
 
-    # (a) headline: MAPPO-proxy vs MaxPressure on the primary metrics
+    # (a) headline: MAPPO-proxy vs LQI (legacy: maxpressure) on the primary metrics
+    if comparator not in aggregates and comparator == "lqi" and "maxpressure" in aggregates:
+        comparator = "maxpressure"
     if comparator in aggregates:
         lines.append(f"**{method_label(reference)} vs {method_label(comparator)}** "
                      f"(Mann–Whitney U two-sided, Cohen's d; Holm-adjusted p from harness):\n")
@@ -520,28 +570,28 @@ def analyse_campaign(campaign: Optional[dict]) -> Tuple[List[str], List[str]]:
     lines.append(f"- Status counts: " + ", ".join(
         f"{k}={v}" for k, v in counts.items()) + "\n")
 
-    # group by arm -> {seed: status}
+    # group by arm -> {seed: status}. Completeness is checked per arm against
+    # THAT arm's own scheduled seeds (e.g. S10 for n3_grid_mappo_proxy vs S5
+    # for secondary/ablation arms) so S5 arms are never falsely flagged against S10.
     arms: Dict[str, Dict[int, str]] = {}
-    all_seeds: set = set()
     for j in jobs:
         arm = _arm_of(j)
         arms.setdefault(arm, {})[j.get("seed")] = j.get("status")
-        all_seeds.add(j.get("seed"))
-    expected_seeds = sorted(s for s in all_seeds if s is not None)
 
     headers = ["Arm", "Seeds done", "Statuses", "Complete?"]
     rows = []
     for arm in sorted(arms):
         per_seed = arms[arm]
-        done = sorted(s for s, st in per_seed.items() if st in ("done", "skipped"))
-        statuses = ",".join(f"{s}:{per_seed[s]}" for s in sorted(per_seed))
-        complete = set(done) >= set(expected_seeds) and len(expected_seeds) > 0
+        arm_seeds = sorted(s for s in per_seed if s is not None)
+        done = sorted(s for s, st in per_seed.items() if s is not None and st in ("done", "skipped"))
+        statuses = ",".join(f"{s}:{per_seed[s]}" for s in arm_seeds)
+        complete = len(arm_seeds) > 0 and set(done) >= set(arm_seeds)
         rows.append([f"`{arm}`",
-                     f"{len(done)}/{len(expected_seeds)}",
+                     f"{len(done)}/{len(arm_seeds)}",
                      statuses,
                      "✅" if complete else "⚠"])
         if not complete:
-            missing = sorted(set(expected_seeds) - set(done))
+            missing = sorted(set(arm_seeds) - set(done))
             bad = [s for s, st in per_seed.items() if st in ("failed", "killed")]
             detail = []
             if missing:

@@ -6,6 +6,7 @@ Generate the scaled SUMO networks for Paper 1 (schema 1.1.0):
     N1  2-junction corridor   — copied from sumo_configs/training (self-contained)
     N2  1x5 signalized corridor (netgenerate grid 5x1 + attached side streets)
     N3  4x4 signalized grid     (netgenerate grid 4x4 + attached side streets)
+    N4  3x6 irregular grid      (18 TLS, non-uniform spacing via plain XML + netconvert)
 
 For every network this script writes, under sumo_configs/networks/<name>/:
 
@@ -18,11 +19,12 @@ For every network this script writes, under sumo_configs/networks/<name>/:
     sumo_config.sumocfg       train config (routes: demand_train.rou.xml)
     sumo_config_eval.sumocfg  eval config  (routes: demand_eval.rou.xml)
 
-Requirements: SUMO_HOME set, `netgenerate` on PATH (SUMO >= 1.16).
+Requirements: SUMO_HOME set, `netgenerate` and `netconvert` on PATH (SUMO >= 1.16).
 
 Run:
     python scripts/generate_networks.py            # all networks
     python scripts/generate_networks.py --only n3_grid
+    python scripts/generate_networks.py --only n4_irregular
 """
 from __future__ import annotations
 
@@ -31,9 +33,10 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORKS_DIR = ROOT / "sumo_configs" / "networks"
@@ -41,7 +44,12 @@ N1_NET = ROOT / "sumo_configs" / "training" / "intersections.net.xml"
 VTYPES_SRC = ROOT / "sumo_configs" / "training" / "vtypes.add.xml"
 
 # expected signalized junction counts (hard validation)
-EXPECTED_TLS = {"n2_corridor": 5, "n3_grid": 16}
+EXPECTED_TLS = {"n2_corridor": 5, "n3_grid": 16, "n4_irregular": 18}
+
+# N4 irregular 3x6 grid: non-uniform inter-junction gaps (m) + 200 m fringe stubs
+N4_COL_GAPS_M: Tuple[float, ...] = (200.0, 350.0, 150.0, 400.0, 250.0)
+N4_ROW_GAPS_M: Tuple[float, ...] = (180.0, 300.0)
+N4_ATTACH_LENGTH_M: float = 200.0
 
 NETGEN_SPECS: Dict[str, List[str]] = {
     "n2_corridor": [
@@ -70,6 +78,16 @@ COMMON_NETGEN_FLAGS = [
     "--tls.yellow.time", "3",
 ]
 
+COMMON_NETCONVERT_FLAGS = [
+    "--default.lanenumber", "2",
+    "--default.speed", "13.89",
+    "--no-turnarounds", "true",
+    "--tls.layout", "opposites",
+    "--tls.green.time", "30",
+    "--tls.yellow.time", "3",
+    "--offset.disable-normalization", "true",
+]
+
 SUMOCFG_TEMPLATE = """<configuration>
     <input>
         <net-file value="intersections.net.xml"/>
@@ -89,6 +107,106 @@ def run_netgenerate(name: str, out_net: Path) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"netgenerate failed for {name}:\n{result.stderr}")
+
+
+def build_irregular_grid_xml(
+    col_gaps: Sequence[float],
+    row_gaps: Sequence[float],
+    attach_length: float,
+    nodes_path: Path,
+    edges_path: Path,
+) -> None:
+    """Write plain SUMO nodes/edges XML for an irregular-spacing grid with fringe stubs."""
+    n_cols = len(col_gaps) + 1
+    n_rows = len(row_gaps) + 1
+    col_labels = [chr(ord("A") + c) for c in range(n_cols)]
+
+    xs: List[float] = [float(attach_length)]
+    for gap in col_gaps:
+        xs.append(xs[-1] + float(gap))
+    ys: List[float] = [float(attach_length)]
+    for gap in row_gaps:
+        ys.append(ys[-1] + float(gap))
+
+    x_left, x_right = 0.0, xs[-1] + float(attach_length)
+    y_bottom, y_top = 0.0, ys[-1] + float(attach_length)
+
+    node_lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<nodes>"]
+    for c in range(n_cols):
+        for r in range(n_rows):
+            nid = f"{col_labels[c]}{r}"
+            node_lines.append(
+                f'    <node id="{nid}" x="{xs[c]:.2f}" y="{ys[r]:.2f}" '
+                f'type="traffic_light" tlType="static" tlLayout="opposites"/>'
+            )
+    for c in range(n_cols):
+        node_lines.append(
+            f'    <node id="bottom{c}" x="{xs[c]:.2f}" y="{y_bottom:.2f}" type="dead_end"/>'
+        )
+        node_lines.append(
+            f'    <node id="top{c}" x="{xs[c]:.2f}" y="{y_top:.2f}" type="dead_end"/>'
+        )
+    for r in range(n_rows):
+        node_lines.append(
+            f'    <node id="left{r}" x="{x_left:.2f}" y="{ys[r]:.2f}" type="dead_end"/>'
+        )
+        node_lines.append(
+            f'    <node id="right{r}" x="{x_right:.2f}" y="{ys[r]:.2f}" type="dead_end"/>'
+        )
+    node_lines.append("</nodes>")
+    nodes_path.write_text("\n".join(node_lines) + "\n", encoding="utf-8")
+
+    edge_pairs: List[Tuple[str, str]] = []
+
+    def _add_bidir(u: str, v: str) -> None:
+        edge_pairs.append((u, v))
+        edge_pairs.append((v, u))
+
+    # Internal links
+    for c in range(n_cols - 1):
+        for r in range(n_rows):
+            _add_bidir(f"{col_labels[c]}{r}", f"{col_labels[c + 1]}{r}")
+    for c in range(n_cols):
+        for r in range(n_rows - 1):
+            _add_bidir(f"{col_labels[c]}{r}", f"{col_labels[c]}{r + 1}")
+
+    # Fringe origin/destination stubs
+    for c in range(n_cols):
+        _add_bidir(f"bottom{c}", f"{col_labels[c]}0")
+        _add_bidir(f"top{c}", f"{col_labels[c]}{n_rows - 1}")
+    for r in range(n_rows):
+        _add_bidir(f"left{r}", f"{col_labels[0]}{r}")
+        _add_bidir(f"right{r}", f"{col_labels[-1]}{r}")
+
+    edge_pairs.sort(key=lambda uv: f"{uv[0]}{uv[1]}")
+    edge_lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<edges>"]
+    for u, v in edge_pairs:
+        edge_lines.append(
+            f'    <edge id="{u}{v}" from="{u}" to="{v}" '
+            f'numLanes="2" speed="13.89" priority="-1"/>'
+        )
+    edge_lines.append("</edges>")
+    edges_path.write_text("\n".join(edge_lines) + "\n", encoding="utf-8")
+
+
+def run_netconvert_irregular(out_net: Path) -> None:
+    """Build n4_irregular via plain XML + netconvert (uniform netgenerate cannot vary gaps)."""
+    with tempfile.TemporaryDirectory(prefix="n4_irregular_xml_") as tmp_dir:
+        tmp = Path(tmp_dir)
+        nodes_path = tmp / "nodes.nod.xml"
+        edges_path = tmp / "edges.edg.xml"
+        build_irregular_grid_xml(
+            N4_COL_GAPS_M, N4_ROW_GAPS_M, N4_ATTACH_LENGTH_M, nodes_path, edges_path
+        )
+        cmd = (
+            ["netconvert", "--node-files", str(nodes_path), "--edge-files", str(edges_path)]
+            + COMMON_NETCONVERT_FLAGS
+            + ["-o", str(out_net)]
+        )
+        print(f"  $ {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"netconvert failed for n4_irregular:\n{result.stderr}")
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +309,23 @@ def validate_groups(net_path: Path, groups: Dict[str, Tuple[List[str], List[str]
 # Per-network assembly
 # ---------------------------------------------------------------------------
 
+def _resolve_vtypes_src(out_path: Path) -> Path:
+    """Locate the canonical mixed-traffic vtypes.add.xml (mirroring n3_grid)."""
+    candidates = [
+        VTYPES_SRC,
+        NETWORKS_DIR / "n3_grid" / "vtypes.add.xml",
+        NETWORKS_DIR / "n2_corridor" / "vtypes.add.xml",
+    ]
+    for p in candidates:
+        if p.exists() and p.resolve() != out_path.resolve():
+            return p
+    if out_path.exists():
+        return out_path
+    raise FileNotFoundError(
+        f"vtypes.add.xml not found in {[str(p) for p in candidates]}"
+    )
+
+
 def write_network_dir(name: str, net_src: Path | None) -> None:
     out_dir = NETWORKS_DIR / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,10 +333,15 @@ def write_network_dir(name: str, net_src: Path | None) -> None:
 
     if net_src is not None:                      # n1: copy existing net
         shutil.copyfile(net_src, out_net)
-    else:                                        # n2/n3: generate
+    elif name == "n4_irregular":                 # n4: plain XML + netconvert
+        run_netconvert_irregular(out_net)
+    else:                                        # n2/n3: netgenerate
         run_netgenerate(name, out_net)
 
-    shutil.copyfile(VTYPES_SRC, out_dir / "vtypes.add.xml")
+    vtypes_dst = out_dir / "vtypes.add.xml"
+    vtypes_src = _resolve_vtypes_src(vtypes_dst)
+    if vtypes_src.resolve() != vtypes_dst.resolve():
+        shutil.copyfile(vtypes_src, vtypes_dst)
 
     groups = derive_lane_groups(out_net)
     expected = EXPECTED_TLS.get(name)
@@ -239,10 +379,14 @@ def write_network_dir(name: str, net_src: Path | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only", choices=["n1", "n2_corridor", "n3_grid"], default=None)
+    parser.add_argument(
+        "--only",
+        choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"],
+        default=None,
+    )
     args = parser.parse_args()
 
-    targets = [args.only] if args.only else ["n1", "n2_corridor", "n3_grid"]
+    targets = [args.only] if args.only else ["n1", "n2_corridor", "n3_grid", "n4_irregular"]
     for name in targets:
         print(f"\n=== {name} ===")
         write_network_dir(name, net_src=N1_NET if name == "n1" else None)

@@ -1,7 +1,7 @@
 """
 generate_demand.py
 ==================
-Time-varying (trapezoidal) demand generation for N1 / N2 / N3 networks.
+Time-varying (trapezoidal) demand generation for N1 / N2 / N3 / N4 networks.
 
 Replaces uniform randomTrips demand with a within-episode peak profile so a
 single 1080-step episode (x 5 s = 5400 s) covers off-peak -> rush hour ->
@@ -272,7 +272,7 @@ def generate_for_network(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid"], default=None,
+    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"], default=None,
                         help="generate for one network only (default: all)")
     parser.add_argument("--seed", type=int, default=42,
                         help="train seed; eval uses seed+1000 (default 42)")
@@ -287,7 +287,7 @@ def main() -> None:
                              "or an explicit float")
     args = parser.parse_args()
 
-    targets = [args.network] if args.network else ["n1", "n2_corridor", "n3_grid"]
+    targets = [args.network] if args.network else ["n1", "n2_corridor", "n3_grid", "n4_irregular"]
     for name in targets:
         generate_for_network(
             name,

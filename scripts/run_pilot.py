@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 RESULTS_ROOT = ROOT / "results" / "paper1_mappo"
-REQUIRED_SCHEMA_VERSION = "1.2.0"   # 1.1.0 obs schema + 1.2.0 reward revision
+REQUIRED_SCHEMA_VERSION = "1.3.0"   # 1.1.0 obs schema + 1.3.0 approach-level reward revision
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ def evaluate_checkpoint(
     import numpy as np
     import torch
 
-    from experiment.common.tripinfo import parse_tripinfo_means
+    from experiment.common.tripinfo import parse_tripinfo_means, tripinfo_sumo_args
     from experiment.runners.train_ppo import Actor, RunningMeanStd
     from src.traffic_env.config import build_default_config, load_lane_groups_json
     from src.traffic_env.envs.multi_agent import MappoTrafficEnv
@@ -178,10 +178,7 @@ def evaluate_checkpoint(
     tripinfo_path = Path(tempfile.gettempdir()) / f"pilot_tripinfo_{run_dir.name}.xml"
     env = MappoTrafficEnv(
         config=env_cfg, gui=False, use_libsumo=False,
-        extra_sumo_args=[
-            "--tripinfo-output", str(tripinfo_path),
-            "--tripinfo-output.write-unfinished",
-        ],
+        extra_sumo_args=tripinfo_sumo_args(tripinfo_path),
     )
 
     obs_dim = env_cfg.local_obs_dim
@@ -281,7 +278,7 @@ def write_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid"],
+    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"],
                         default="n3_grid")
     parser.add_argument("--algo", choices=["mappo", "ippo"], default="mappo")
     parser.add_argument("--seed", type=int, default=42)

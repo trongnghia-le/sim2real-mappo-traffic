@@ -22,9 +22,9 @@ Switch decision (applied per TLS per step):
 
 Otherwise hold the current phase.
 
-Parameters (defaults calibrated to step_length=5 s, max_green=60 s)
--------------------------------------------------------------------
-    phi_min  =  2 steps  (= 10 s minimum green, same as env min_green_time)
+Parameters (defaults calibrated to step_length=5 s, min_green=15 s, max_green=60 s)
+-----------------------------------------------------------------------------------
+    phi_min  =  3 steps  (= 15 s minimum green, same as env min_green_time)
     phi_max  = 12 steps  (= 60 s maximum green, same as env max_green_time)
     kappa    =  5 vehicles  (switch threshold on red approach)
 
@@ -61,8 +61,8 @@ SUMO_CFG = _ROOT / "sumo_configs" / "evaluation" / "medium" / "sumo_config.sumoc
 DEFAULT_EPISODES = 10
 DEFAULT_MAX_STEPS = 1080
 
-# SOTL thresholds (literature defaults)
-DEFAULT_PHI_MIN = 2    # env steps (= 10 s at step_length=5 s)
+# SOTL thresholds (aligned to SimConfig: step_length=5 s, min_green=15 s, max_green=60 s)
+DEFAULT_PHI_MIN = 3    # env steps (= 15 s at step_length=5 s)
 DEFAULT_PHI_MAX = 12   # env steps (= 60 s)
 DEFAULT_KAPPA   = 5    # vehicles waiting on red approach before switch
 
@@ -97,27 +97,35 @@ class SOTLPolicy:
         phi_min: int = DEFAULT_PHI_MIN,
         phi_max: int = DEFAULT_PHI_MAX,
         kappa: int   = DEFAULT_KAPPA,
+        step_length: float = 5.0,
+        yellow_time: float = 3.0,
     ) -> None:
         self.lane_groups = lane_groups
         self.phi_min = int(phi_min)
         self.phi_max = int(phi_max)
         self.kappa   = int(kappa)
+        self.step_length = float(step_length)
+        self.yellow_time = float(yellow_time)
         self._tls_ids = list(lane_groups.keys())
 
         # Per-TLS mutable state
         self._current_action: Dict[str, int] = {}
         self._steps_on_phase: Dict[str, int] = {}
+        self._elapsed_green_s: Dict[str, float] = {}
         self.reset()
 
     def reset(self) -> None:
         """Reset all per-TLS state to phase 0, step 0."""
         self._current_action = {tid: 0 for tid in self._tls_ids}
         self._steps_on_phase = {tid: 0 for tid in self._tls_ids}
+        self._elapsed_green_s = {tid: 0.0 for tid in self._tls_ids}
 
     # ------------------------------------------------------------------
     def select_actions(
         self,
         lane_cache: Dict[str, Dict[str, float]],
+        green_timers: Optional[Dict[str, float]] = None,
+        current_actions: Optional[Dict[str, int]] = None,
     ) -> Dict[str, int]:
         """
         Evaluate the SOTL rule for each TLS and return the action map.
@@ -126,28 +134,48 @@ class SOTLPolicy:
         ----------
         lane_cache : output of ObservationBuilder.build_lane_cache()
             Must contain ``raw_vehicle_count`` for every monitored lane.
+        green_timers : optional {tls_id: elapsed_green_s} from the environment.
+            When provided, synchronises elapsed green time with the env so
+            post-yellow residual green and env-enforced overrides never drift.
+        current_actions : optional {tls_id: action_idx} from the environment.
         """
         actions: Dict[str, int] = {}
+        min_green_s = float(self.phi_min) * self.step_length
+        max_green_s = float(self.phi_max) * self.step_length
+        post_switch_green_s = float(max(self.step_length - self.yellow_time, 0.0))
 
         for tls_id in self._tls_ids:
             group_a, group_b = self.lane_groups[tls_id]
-            current = self._current_action[tls_id]
-            steps   = self._steps_on_phase[tls_id]
+            if current_actions is not None and tls_id in current_actions:
+                current = int(current_actions[tls_id])
+                self._current_action[tls_id] = current
+            else:
+                current = self._current_action[tls_id]
+
+            if green_timers is not None and tls_id in green_timers:
+                elapsed_s = float(green_timers[tls_id])
+                self._elapsed_green_s[tls_id] = elapsed_s
+            else:
+                elapsed_s = self._elapsed_green_s[tls_id]
+
+            steps = self._steps_on_phase[tls_id]
 
             # Identify green / red groups for this step
-            green_lanes = group_a if current == 0 else group_b
-            red_lanes   = group_b if current == 0 else group_a
+            red_lanes = group_b if current == 0 else group_a
 
             n_red = sum(
                 float(lane_cache.get(lid, {}).get("raw_vehicle_count", 0.0))
                 for lid in red_lanes
             )
 
-            # SOTL switching logic
-            if steps >= self.phi_max:
-                # Force switch — maximum green exceeded
+            # SOTL switching logic accounting for post-yellow residual green:
+            # after a switch step, the new green already runs for
+            # (step_length - yellow_time) s, so force a switch whenever another
+            # full hold step would exceed phi_max * step_length.
+            if (elapsed_s + self.step_length) > (max_green_s + 1e-9):
+                # Force switch — holding another step would exceed maximum green
                 want_switch = True
-            elif steps >= self.phi_min and n_red >= self.kappa:
+            elif elapsed_s >= (min_green_s - 1e-9) and n_red >= self.kappa:
                 # Demand-driven switch — competing approach is congested
                 want_switch = True
             else:
@@ -156,8 +184,10 @@ class SOTLPolicy:
             if want_switch:
                 new_action = 1 - current   # toggle between 0 and 1
                 self._current_action[tls_id] = new_action
-                self._steps_on_phase[tls_id] = 0
+                self._elapsed_green_s[tls_id] = post_switch_green_s
+                self._steps_on_phase[tls_id] = 1 if post_switch_green_s > 0.0 else 0
             else:
+                self._elapsed_green_s[tls_id] = elapsed_s + self.step_length
                 self._steps_on_phase[tls_id] = steps + 1
 
             actions[tls_id] = self._current_action[tls_id]
@@ -244,8 +274,17 @@ def run_episode(
         # Build lane cache before action (current SUMO state)
         lane_cache = env.obs_builder.build_lane_cache(env.tls_ids)
 
-        # SOTL decision
-        action_dict = policy.select_actions(lane_cache)
+        # SOTL decision (synced with env timers and current green phase)
+        current_actions = {
+            t: env._green_phase_map[t].index(env._current_green_phase[t])
+            for t in env.tls_ids
+            if t in env._green_phase_map and env._current_green_phase.get(t) in env._green_phase_map[t]
+        }
+        action_dict = policy.select_actions(
+            lane_cache,
+            green_timers=env.green_timers,
+            current_actions=current_actions,
+        )
 
         obs, reward, terminated, truncated, info = env.step(action_dict)
         done = any(terminated.values()) or any(truncated.values())
@@ -310,6 +349,8 @@ def evaluate(
         phi_min=phi_min,
         phi_max=phi_max,
         kappa=kappa,
+        step_length=cfg.sim.step_length,
+        yellow_time=cfg.sim.yellow_time,
     )
 
     keys = ["total_waiting", "mean_halted", "mean_speed_mps", "final_throughput"]

@@ -28,13 +28,132 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+MIN_SCHEMA_VERSION = "1.3.0"
+
+
+def parse_schema_version(version: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Parse a dot-separated schema version string (e.g. '1.3.0') into an int tuple."""
+    if not version or not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _version_lt(a: Tuple[int, ...], b: Tuple[int, ...]) -> bool:
+    n = max(len(a), len(b))
+    a_pad = a + (0,) * (n - len(a))
+    b_pad = b + (0,) * (n - len(b))
+    return a_pad < b_pad
+
+
+def is_legacy_schema_version(
+    version: Optional[str],
+    min_version: str = MIN_SCHEMA_VERSION,
+) -> bool:
+    """Return True if ``version`` is missing, unparseable, or < ``min_version``."""
+    ver_tuple = parse_schema_version(version)
+    min_tuple = parse_schema_version(min_version)
+    if ver_tuple is None:
+        return True
+    if min_tuple is None:
+        return False
+    return _version_lt(ver_tuple, min_tuple)
+
+
+def read_checkpoint_schema_version(
+    checkpoint_path: Union[str, Path],
+    ckpt: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], bool]:
+    """Read env schema version from sibling ``run_config.json`` or ``ckpt['env_cfg']``.
+
+    Returns ``(version_or_None, has_metadata)`` where ``has_metadata`` is True
+    when sibling ``run_config.json`` exists or ``ckpt`` embeds ``env_cfg``.
+    """
+    path = Path(checkpoint_path)
+    cfg_path = path.parent / "run_config.json"
+    has_metadata = False
+
+    if cfg_path.exists():
+        has_metadata = True
+        try:
+            rc = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(rc, dict):
+                ver = (rc.get("env_cfg") or {}).get("version") or rc.get("version")
+                if ver is not None:
+                    return str(ver), True
+        except Exception:
+            pass
+
+    if isinstance(ckpt, dict) and "env_cfg" in ckpt:
+        has_metadata = True
+        env_cfg = ckpt.get("env_cfg")
+        if isinstance(env_cfg, dict) and env_cfg.get("version") is not None:
+            return str(env_cfg["version"]), True
+
+    return None, has_metadata
+
+
+def validate_checkpoint_schema(
+    checkpoint_path: Union[str, Path],
+    *,
+    min_version: str = MIN_SCHEMA_VERSION,
+    allow_legacy: bool = False,
+    ckpt: Optional[Dict[str, Any]] = None,
+    require_version: bool = True,
+) -> Optional[str]:
+    """Refuse checkpoints whose env schema version is below ``min_version``.
+
+    Raises ``ValueError`` with a clear message unless ``allow_legacy=True``.
+    When ``require_version=False``, bare weight-only checkpoints without sibling
+    ``run_config.json`` or embedded ``env_cfg`` are allowed.
+    """
+    version, has_metadata = read_checkpoint_schema_version(checkpoint_path, ckpt=ckpt)
+    min_tuple = parse_schema_version(min_version)
+    ver_tuple = parse_schema_version(version)
+
+    if version is None:
+        if not require_version and not has_metadata:
+            return None
+        if allow_legacy:
+            logger.warning(
+                "Allowing checkpoint %s with missing env schema version "
+                "(--allow-legacy-schema; paper results require >= %s)",
+                checkpoint_path, min_version,
+            )
+            return None
+        raise ValueError(
+            f"Refusing checkpoint {checkpoint_path}: missing env schema version in "
+            f"run_config.json (paper results require env schema >= {min_version}; "
+            f"pass --allow-legacy-schema to override)."
+        )
+
+    if ver_tuple is None or (min_tuple is not None and _version_lt(ver_tuple, min_tuple)):
+        if allow_legacy:
+            logger.warning(
+                "Allowing legacy checkpoint %s with env schema %s < %s "
+                "(--allow-legacy-schema)",
+                checkpoint_path, version, min_version,
+            )
+            return version
+        raise ValueError(
+            f"Refusing legacy checkpoint {checkpoint_path}: env schema version "
+            f"{version!r} < required {min_version!r} (reward and timing changed in "
+            f"{min_version}; pass --allow-legacy-schema to override)."
+        )
+
+    return version
 
 
 class RunningMeanStd:
@@ -181,12 +300,18 @@ class PolicyLoader:
         action_dim: int = 2,
         hidden_dim: int = 256,
         device: str = "cpu",
+        min_schema_version: Optional[str] = MIN_SCHEMA_VERSION,
+        allow_legacy_schema: bool = False,
+        require_schema_version: bool = False,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.device = device
+        self.min_schema_version = min_schema_version
+        self.allow_legacy_schema = allow_legacy_schema
+        self.require_schema_version = require_schema_version
 
     def load(self) -> "LoadedPolicy":
         """Load and return a ready-to-use policy wrapper."""
@@ -196,6 +321,16 @@ class PolicyLoader:
             raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
 
         ckpt = torch.load(str(self.checkpoint_path), map_location=self.device, weights_only=False)
+
+        # ── 0. Validate env schema version if configured ──────────────────────
+        if self.min_schema_version is not None:
+            validate_checkpoint_schema(
+                self.checkpoint_path,
+                min_version=self.min_schema_version,
+                allow_legacy=self.allow_legacy_schema,
+                ckpt=ckpt if isinstance(ckpt, dict) else None,
+                require_version=self.require_schema_version,
+            )
 
         # ── 1. Extract the raw state dict ─────────────────────────────────────
         raw_sd = self._extract_state_dict(ckpt)

@@ -2,15 +2,19 @@
 
 **File:** `src/traffic_env/components/rewards.py`  
 **Config:** `src/traffic_env/config.py` → `RewardConfig`, `DEFAULT_REWARD_WEIGHTS`  
-**Revision:** **1.2.0** (2026-06-12, W5 campaign — see §6 for the change log)
+**Revision:** **1.3.0** (approach-level reward alignment — see §6 for the change log)
 
-> **LEGACY WARNING:** checkpoint `20260418_215140` was trained on a pre-1.1.0
-> reward (no pressure term active — bug R1) and must not be used for paper
-> results. All results require retraining with `env_cfg.version >= 1.1.0`.
+> **LEGACY WARNING:** All paper results require `env_cfg.version >= 1.3.0`
+> (guarded by `PolicyLoader` and `eval_compare.py`). All 1.2.0-era checkpoints
+> (per-lane reward aggregation, per-lane ID diffs, un-enforced env max-green)
+> and legacy checkpoint `20260418_215140` (pre-1.1.0, bug R1 inert pressure)
+> are invalid for paper results; do not pool results across schema versions.
 
 ---
 
 ## 1. Reward Equation
+
+Every reward term operates on **approach aggregates** ($a \in A$, where each controlled approach groups all incoming lanes of one parent edge via `group_lanes_by_approach` and aggregates them via `aggregate_approach_metrics` — the exact same rule used by `ObservationBuilder`: unweighted mean across lanes for queue/occupancy, vehicle-count-weighted mean for speed):
 
 $$
 R(t) = w_q \cdot \text{queue}(t)
@@ -18,7 +22,7 @@ R(t) = w_q \cdot \text{queue}(t)
      + w_t \cdot \text{throughput}(t)
      + w_s \cdot \text{switch}(t)
      + w_{sp} \cdot \text{low\_speed}(t)
-     + w_w \cdot \text{waiting}(t)
+     + w_w \cdot \text{queue\_occupancy}(t)
 $$
 
 **Final output:**
@@ -27,75 +31,60 @@ $$
 r_{\text{agent}} = \text{clip}(R(t) \times \text{scale},\ \text{clip\_low},\ \text{clip\_high})
 $$
 
-All component functions return values in `[0, 1]` except `pressure` which is **signed** in `[−1, 1]` (1.2.0) and `switch_penalty` which is unbounded above. Signs are applied via weights. **Penalty weights are negative; reward weights are positive** — for the signed pressure term this means wrong-side green is penalised AND correct-side green is rewarded.
+All component functions return values in `[0, 1]` except `pressure` which is **signed** in `[−1, 1]` and `switch_penalty` which is unbounded above. Signs are applied via weights. **Penalty weights are negative; reward weights are positive** — for the signed pressure term this means wrong-side green is penalised AND correct-side green is rewarded.
 
 ---
 
 ## 2. Component Reference
 
-### 2.1 `queue_penalty` — Nonlinear Congestion *(1.2.0: mean of squares)*
+### 2.1 `queue_penalty` — Nonlinear Congestion *(1.3.0: approach-level mean of squares)*
 
 $$
-\text{queue}(t) = \text{clip}\!\left(\frac{1}{|L|}\sum_{l \in L} q_l^{\,2},\; 0,\; 1\right)
+\text{queue}(t) = \text{clip}\!\left(\frac{1}{|A|}\sum_{a \in A} q_a^{\,2},\; 0,\; 1\right)
 \quad\text{where}\quad
-q_l = \text{effective\_queue\_norm}(l)
+q_a = \frac{1}{|L_a|}\sum_{l \in L_a} \text{effective\_queue\_norm}(l)
 $$
 
 | Property | Value |
 |---|---|
 | Range | `[0, 1]` |
 | Default weight | `−1.0` |
-| SUMO source | `traci.lane.getLastStepHaltingNumber` / cap |
-| Vision proxy | halted-vehicle fraction in ROI polygon |
+| SUMO source | Approach-averaged `effective_queue_norm` (`Σ halted_len / lane_len`, `v ≤ 0.1 m/s`) |
+| Camera counterpart | Halted-vehicle length fraction in approach ROI polygon |
+| Ablation flag | `queue_mean_of_squares=False` computes $(\frac{1}{|A|}\sum_{a \in A} q_a)^2$ |
 
-**Rationale:** Squaring provides near-zero gradient in free-flow conditions and strong gradient during sustained congestion (PRESSLIGHT's saturation-aware design).
-
-**1.2.0 change (bug R4):** the formula is `mean(q²)` — mean of squares, **not**
-`mean(q)²`. By Jensen's inequality `mean(q²) ≥ mean(q)²` with equality only
-when all lanes are equal, so a single saturated lane among many empty ones is
-penalised heavily instead of being averaged away (anti-starvation guard). The
-pre-1.2.0 `mean(q)²` form let one starved lane hide behind a low average.
+**Rationale:** Squaring provides near-zero gradient in free-flow conditions and strong gradient during sustained congestion (PRESSLIGHT's saturation-aware design). By Jensen's inequality `mean_a(q_a²) ≥ (mean_a q_a)²` with equality only when all approaches are equal, so one saturated approach among empty ones cannot hide behind a low average (anti-starvation guard).
 
 ---
 
-### 2.2 `pressure_penalty` — Phase-Aware Queue Imbalance *(PRESSLIGHT / CoLight; 1.2.0: SIGNED)*
+### 2.2 `pressure_penalty` — Phase-Aware Approach Queue Imbalance *(PRESSLIGHT / CoLight; 1.3.0: approach-level SIGNED)*
 
 $$
-\text{pressure}(t) = \text{clip}\!\left(\frac{\sum_{l \in L_{\text{red}}} q_l - \sum_{l \in L_{\text{green}}} q_l}{|L_{\text{red}}| + |L_{\text{green}}|},\; -1,\; 1\right)
+\text{pressure}(t) = \text{clip}\!\left(\frac{\sum_{a \in A_{\text{red}}} q_a - \sum_{a \in A_{\text{green}}} q_a}{|A|},\; -1,\; 1\right)
 $$
 
 | Property | Value |
 |---|---|
-| Range | **`[−1, 1]`** (signed, 1.2.0) |
+| Range | **`[−1, 1]`** (signed; `pressure_signed=False` clips below at `0`) |
 | Default weight | `−0.5` |
-| Requires | `green_lanes_by_tls` in `action_info` (wired in `multi_agent.py` since 2026-06-12) |
-| Returns | `0.0` (neutral) if phase-lane info is absent |
-| Vision proxy | same `effective_queue_norm` partitioned by phase group |
+| Green/red membership | TLS group A / group B approaches from `lane_groups` (wired via `green_lanes_by_tls`) |
+| Returns | `0.0` (neutral) if phase-group info is absent |
+| Camera counterpart | Same signed group A/B difference over approach ROI `q_a` |
 
-**Rationale:** This is the core signal from PRESSLIGHT (Wei et al., KDD 2019). Positive value = red-side lanes carry more queue than green-side lanes (wrong phase held); with the negative weight this is a penalty. Negative value = green correctly serves the more congested side; the negative weight turns this into a **positive reward**.
+**Rationale:** Core PRESSLIGHT signal (Wei et al., KDD 2019) at approach granularity. Positive value = red approaches carry more queue than green approaches (wrong phase held; penalised by `−0.5`). Negative value = green serves the more congested approaches (rewarded by `−0.5`, restoring gradient on correct decisions).
 
-**1.2.0 change (bug R3):** the pre-1.2.0 form was one-sided
-`max(red − green, 0)`, which gave **zero gradient whenever the allocation was
-already correct** — the policy was never rewarded for the right decision. The
-signed form restores gradient on both sides.
-
-**Bug R1 (FIXED 2026-06-12):** `MappoTrafficEnv.step` previously never passed
-`green_lanes_by_tls` to the `RewardCalculator`, so this term was silently
-`0.0` in **all** training runs before that date (including checkpoint
-`20260418_215140`). It is now populated every step from the manual lane groups
-(see §7); red lanes are derived automatically as
-`all_controlled_lanes − green_lanes`.
+**Bug R1 (FIXED 2026-06-12):** `MappoTrafficEnv.step` previously never passed `green_lanes_by_tls`, leaving pressure silently `0.0` in all earlier runs (including `20260418_215140`). It is now populated every step from `lane_groups` (see §7).
 
 ---
 
-### 2.3 `throughput_reward` — LOCAL Lane-Exit Count *(1.2.0)*
+### 2.3 `throughput_reward` — LOCAL Approach-Exit Count *(1.3.0)*
 
-**Primary path (1.2.0, bug R5):** per-agent count of vehicles that left this
-agent's controlled lanes since the previous decision step, computed from
-per-lane vehicle-ID set differences:
+**Primary path (1.3.0):** per-agent count of vehicles that exited any controlled approach edge since the previous decision step. For each approach $a$, the active vehicle set is the **union** of vehicle IDs across all lanes $l \in L_a$ of that approach edge:
 
 $$
-\text{throughput}(t) = \text{clip}\!\left(\frac{1}{D}\sum_{l \in L} \bigl|\,\text{ids}_{t-1}(l) \setminus \text{ids}_t(l)\,\bigr|,\; 0,\; 1\right)
+\text{ids}_t(a) = \bigcup_{l \in L_a} \text{ids}_t(l),
+\qquad
+\text{throughput}(t) = \text{clip}\!\left(\frac{1}{D}\sum_{a \in A} \bigl|\,\text{ids}_{t-1}(a) \setminus \text{ids}_t(a)\,\bigr|,\; 0,\; 1\right)
 $$
 
 | Property | Value |
@@ -103,16 +92,12 @@ $$
 | Range | `[0, 1]` |
 | Default weight | `+1.0` |
 | `D` (divisor) | `config.reward.throughput_norm_divisor` = 20 |
-| SUMO source | `lane_cache[lane_id]["vehicle_ids"]` set differences (training-only key, populated by `ObservationBuilder._lane_metrics`) |
-| Vision proxy | ByteTrack IDs exiting ROI per step — **exact semantic match** |
+| SUMO source | Per-approach union of `lane_cache[lane_id]["vehicle_ids"]`, differenced across steps |
+| Camera counterpart | Stop-line-crossing count in `src/vision/state_extractor.py` (`LaneROI.stop_line`, bbox bottom-centre crossing in exit direction, `min_track_frames=3`, counted at most once per track ID; tracks disappearing inside the ROI are NOT exits) |
 
-Each agent is credited only for traffic it actually served — no cross-agent
-splitting. This also makes the SUMO training signal semantically identical to
-the documented vision proxy (ROI exit events).
+Because all lanes of an approach share a single set, a vehicle changing lanes within the same approach edge yields **0 exits** (fixing the 1.2.0 per-lane double-counting bug in sub-lane mixed traffic). Each agent is credited only for traffic it served — no cross-agent splitting. Note that SUMO set-difference exits and camera stop-line crossings are **not identical mechanisms**: on the camera side, a track lost inside the ROI due to occlusion or detector drop must not be counted as an exit, so `StateExtractor` uses an explicit stop-line segment (`LaneROI.stop_line`, exposed per decision step via `StateExtractor.get_step_exits()` and `build_state(..., return_info=True)["approach_exits"]`) rather than raw ID disappearance.
 
-**Fallback path (pre-1.2.0 behaviour):** when the lane cache carries no
-`vehicle_ids` (synthetic test fixtures, external callers), the global
-`simulation.getArrived()` delta is split equally across agents:
+**Fallback path (pre-1.2.0 behaviour, untouched):** when the lane cache carries no `vehicle_ids` (synthetic test fixtures, external callers), the global `simulation.getArrived()` delta is split equally across agents:
 
 $$
 \text{throughput}_{\text{fallback}}(t) = \frac{\text{clip}(\Delta V / D,\; 0,\; 1)}{N_{\text{agents}}}
@@ -120,10 +105,7 @@ $$
 \Delta V = V_{\text{current}} - V_{\text{prev}}
 $$
 
-The global path has high variance and diluted credit at scale (every agent
-receives the same signal regardless of contribution) — that is why it was
-demoted to fallback. The switch is automatic per step (`has_lane_ids` in
-`calculate_rewards`).
+The switch is automatic per step (`has_approach_ids` in `calculate_rewards`).
 
 ---
 
@@ -139,62 +121,60 @@ $$
 | Default weight | `−0.1` |
 | Source | `action_info["switches_by_tls"]` |
 
-Prevents rapid phase cycling. The weight magnitude controls the minimum effective green time the policy will voluntarily hold.
+Prevents rapid phase cycling. No camera dependency.
 
 ---
 
-### 2.5 `low_speed_penalty` — Mean Speed Below Threshold
+### 2.5 `low_speed_penalty` — Mean Approach Speed Below Threshold *(1.3.0)*
 
 $$
-\text{low\_speed}(t) = \max(\tau_s - \overline{v},\; 0)
-\quad\text{where}\quad
-\overline{v} = \frac{1}{|L|}\sum_{l \in L} \text{avg\_speed\_norm}(l)
+\text{low\_speed}(t) = \max(\tau_s - \overline{v},\; 0),
+\quad
+\overline{v} = \frac{1}{|A|}\sum_{a \in A} v_a,
+\quad
+v_a = \frac{\sum_{l \in L_a} n_l\,\text{avg\_speed\_norm}(l)}{\sum_{l \in L_a} n_l}
 $$
+
+(falling back to unweighted lane mean on empty approaches where $\sum_{l \in L_a} n_l = 0$, identical to `aggregate_approach_metrics`).
 
 | Property | Value |
 |---|---|
 | Range | `[0, τ_s]` |
 | Default weight | `−0.2` |
 | `τ_s` | `config.reward.low_speed_threshold` = 0.20 |
-| Vision proxy | ByteTrack pixel-displacement speed estimate |
+| Camera counterpart | Mean ByteTrack displacement speed across tracked vehicles in each approach ROI |
 
-> **Vision deployment note:** Speed estimated from ByteTrack pixel displacement is significantly noisier than SUMO speed. Consider setting `"low_speed_penalty": 0.0` in `RewardConfig.weights` when deploying with YOLO + ByteTrack to avoid reward noise corrupting the policy.
+> **Vision deployment note:** Speed estimated from ByteTrack pixel displacement is significantly noisier than SUMO speed. Consider setting `"low_speed_penalty": 0.0` in `RewardConfig.weights` when evaluating reward diagnostics on vision streams.
 
 ---
 
-### 2.6 `waiting_penalty` — Accumulated Delay
+### 2.6 `queue_occupancy` (formerly `waiting_penalty`) — Mean Halted-Queue Occupancy *(1.3.0)*
 
 $$
-\text{waiting}(t) = \text{clip}\!\left(\overline{w},\; 0,\; 1\right)
+\text{queue\_occupancy}(t) = \text{clip}\!\left(\frac{1}{|A|}\sum_{a \in A} q_a,\; 0,\; 1\right)
 \quad\text{where}\quad
-\overline{w} = \frac{1}{|L|}\sum_{l \in L} s(l)
-$$
-
-$$
-s(l) = \begin{cases}
-\text{waiting\_time\_norm}(l) & \text{if available in lane\_cache} \\
-\text{effective\_queue\_norm}(l) & \text{(vision proxy)}
-\end{cases}
+q_a = \frac{1}{|L_a|}\sum_{l \in L_a} \text{effective\_queue\_norm}(l)
 $$
 
 | Property | Value |
 |---|---|
 | Range | `[0, 1]` |
-| Default weight | `−0.3` |
-| SUMO source | `traci.lane.getWaitingTime` / `waiting_cap` *(latent hook — see note)* |
-| Vision proxy | halted-vehicle fraction (same as queue) |
+| Default weight | `−0.3` (weight key `"queue_occupancy"`; backward-compatible fallback to legacy `"waiting_time"`) |
+| SUMO source | Mean approach `effective_queue_norm` (halted-vehicle length fraction, `v ≤ 0.1 m/s`) |
+| Camera counterpart | Mean halted-vehicle length fraction across approach ROIs (same camera quantity as `queue_penalty`) |
 
-> **Note (2026-06-17) — no privileged read in practice.** The environment never
-> writes `waiting_time_norm` into the lane cache: neither the proxy nor the
-> privileged builder does (the privileged arm emits `privileged_waiting_norm`,
-> namespaced so the reward stays identical across arms). The `waiting_time_norm`
-> branch above is therefore a latent hook; in **both** training arms `s(l)` is
-> always the `effective_queue_norm` proxy, so the reward is **fully
-> camera-computable with zero privileged terms**. The paper (III-B / IV-A) is
-> framed accordingly, and the VI-F ablation tests *removing* this linear delay
-> term (`w_w=0`), not toggling a (non-existent) privileged read.
+**Clarification (1.3.0):** This term is the **linear mean halted-queue occupancy** across approaches, **not** accumulated vehicle delay (`getWaitingTime` is never read by the default reward). It provides a linear congestion penalty complementing the quadratic anti-starvation `queue_penalty` (`mean_a(q_a²)`), so every reward term has a camera-side computation at approach granularity in both the camera-proxy and privileged-observation reference arms. The weight key was renamed from `"waiting_time"` to `"queue_occupancy"` in 1.3.0, while `RewardCalculator` falls back to `"waiting_time"` when loading pre-1.3.0 weight dicts.
 
-**Previous bug (fixed):** The old implementation multiplied by `step_length / max_green_time` (= `5/60` = 0.083), capping the output at ≤ 0.083 and making the term functionally negligible. This division is removed.
+### 2.7 Privileged-Reward Ablation (`--reward-preset privileged`, 1.3.0)
+
+To isolate the camera-computable reward design from the observation restriction, `train_ppo.py --reward-preset privileged` sets `RewardConfig.privileged_reward=True` while keeping the **26-dim camera-proxy observation unchanged**. In this ablation arm only, `RewardCalculator` substitutes exact per-lane simulator quantities:
+
+- `queue_penalty`: per-lane mean of squared `privileged_halt_count_norm` (exact halted counts),
+- `pressure_penalty`: per-lane signed `privileged_halt_count_norm` imbalance across green/red lanes,
+- `throughput_reward`: global `simulation.getArrived()` delta split across agents,
+- `queue_occupancy` slot: per-lane mean `privileged_waiting_norm` (exact accumulated SUMO waiting time).
+
+`switch_penalty` and `low_speed_penalty` keep their standard definitions and weights.
 
 ---
 
@@ -207,13 +187,9 @@ $$
 | `throughput_reward` | `[0, 1]` | `+1.0` | `[0, +1.0]` |
 | `switch_penalty` | `[0, 1]` | `−0.1` | `[−0.1, 0]` |
 | `low_speed_penalty` | `[0, 0.2]` | `−0.2` | `[−0.04, 0]` |
-| `waiting_penalty` | `[0, 1]` | `−0.3` | `[−0.3, 0]` |
+| `queue_occupancy` | `[0, 1]` | `−0.3` | `[−0.3, 0]` |
 | **Total (raw)** | | | **`[−1.94, +1.50]`** |
 | **After clip** | | | **`[−2.0, +1.5]`** |
-
-With the 1.2.0 signed pressure and local throughput, the positive end of the
-raw range genuinely reaches the `+1.5` clip bound (was capped at `+0.50`
-pre-1.2.0); the lower bound remains tight against the clip.
 
 ---
 
@@ -227,9 +203,9 @@ action_info = {
         "J2": ["lane_id_4", "lane_id_5", ...],
     },
 
-    # Recommended — enables pressure_penalty
+    # Recommended — enables pressure_penalty (mapped to approach groups via lane_groups)
     "green_lanes_by_tls": {
-        "J0": ["lane_id_0", "lane_id_1"],   # currently green
+        "J0": ["lane_id_0", "lane_id_1"],   # currently green group
         "J2": ["lane_id_4", "lane_id_5"],
     },
 
@@ -250,36 +226,26 @@ action_info = {
 }
 ```
 
-**Local throughput (1.2.0) does not use `action_info`** — it reads
-`lane_cache[lane_id]["vehicle_ids"]` (a training-only key populated by
-`ObservationBuilder._lane_metrics`) and diffs the per-lane ID sets across
-consecutive `calculate_rewards` calls. `RewardCalculator.reset()` clears the
-internal `_prev_lane_vehicle_ids` snapshot at episode boundaries.
+**Local approach throughput (1.3.0) does not use `action_info`** — it unions
+`lane_cache[lane_id]["vehicle_ids"]` over all lanes belonging to each approach
+edge and diffs the per-approach ID sets across consecutive `calculate_rewards`
+calls. `RewardCalculator.reset()` clears `_prev_approach_vehicle_ids` at episode
+boundaries.
 
 ---
 
-## 5. Sim-to-Real Alignment
+## 5. Sim-to-Real Alignment (Approach Granularity)
 
-The reward was designed so every component has a direct vision proxy computable from YOLO + ByteTrack detections. However, the reward is **only used during training in SUMO**. During deployment, only the trained policy runs — no reward is computed.
+The reward is **only computed during training in SUMO**, never at deployment. Every reward term has a camera-side computation at approach granularity ($a \in A$: incoming edge in SUMO ↔ approach ROI in camera) so the training objective depends exclusively on quantities a roadside camera can observe in motorcycle-dominant mixed traffic:
 
-The alignment matters because if SUMO training metrics and vision inference metrics diverge significantly, the policy will not generalise. The table below summarises alignment quality:
+- **`queue_penalty`**: SUMO `mean_a(q_a²)` where `q_a` is the unweighted mean of `effective_queue_norm` (`Σ halted_len / lane_len`, `v ≤ 0.1 m/s`) over lanes of approach `a` `<->` camera `mean_a(q_a²)` where `q_a` is the halted-vehicle length fraction (`Σ class_len_px / roi_len_px`, `v < 0.1 m/s`) in approach ROI `a`.
+- **`pressure_penalty`**: SUMO `(Σ_{a∈A_red} q_a − Σ_{a∈A_green} q_a) / |A|` partitioned by group A/B approaches (`lane_groups`) `<->` camera signed difference `(Σ_{a∈A_red} q_a − Σ_{a∈A_green} q_a) / |A|` over group A/B approach ROIs using camera `q_a`.
+- **`throughput_reward`**: SUMO `clip((1/D) Σ_a |ids_{t-1}(a) \ ids_t(a)|, 0, 1)` on per-approach vehicle-ID unions across all lanes of edge `a` (intra-approach lane changes = 0 exits) `<->` camera `clip((1/D) Σ_a crossings_t(a), 0, 1)` from `StateExtractor.get_step_exits()` (`src/vision/state_extractor.py`: stop-line crossing on bbox bottom-centre, `min_track_frames=3`, counted at most once per track ID; tracks disappearing inside the ROI are NOT exits).
+- **`switch_penalty`**: SUMO `1[phase switched at step t]` from signal-controller action state `<->` camera/deployment identical signal-controller action logic (zero vision dependency).
+- **`low_speed_penalty`**: SUMO `max(τ_s − mean_a(v_a), 0)` where `v_a` is the vehicle-count-weighted mean of `avg_speed_norm` across lanes of approach `a` `<->` camera `max(τ_s − mean_a(v_a), 0)` where `v_a` is the mean ByteTrack displacement speed (`Δpos / Δt / speed_cap`) across tracked vehicles in approach ROI `a`.
+- **`queue_occupancy`**: SUMO `mean_a(q_a)` unweighted mean of approach halted-queue occupancy `q_a` across approaches `<->` camera `mean_a(q_a)` mean halted-vehicle length fraction across approach ROIs (linear counterpart to `queue_penalty`).
 
-| Component | SUMO metric | Vision proxy | Alignment |
-|---|---|---|---|
-| `queue_penalty` | `getLastStepHaltingNumber` / cap | Halted vehicles in ROI / cap | ✓ Good |
-| `pressure_penalty` | Same, partitioned by phase | Same | ✓ Good |
-| `throughput_reward` | Per-lane vehicle-ID exits (local, 1.2.0) | Track IDs exiting ROI | ✓ Good* |
-| `switch_penalty` | Action logic | Action logic | ✓ Exact |
-| `low_speed_penalty` | `getLastStepMeanSpeed` | Pixel-displacement estimate | ✗ Noisy |
-| `waiting_penalty` | `getWaitingTime` / cap | Queue proxy (no per-vehicle timer) | ⚠ Proxy |
-
-\* The 1.2.0 local lane-exit formulation is the **same event semantics** as
-ByteTrack ROI exits (was ⚠ Partial pre-1.2.0, when SUMO counted network-level
-arrivals). Residual gap: ByteTrack track loss under occlusion looks identical
-to a true exit, so the vision-side count over-fires — hence the reduced
-throughput weight recommended below.
-
-**Recommended weights for vision deployment:**
+**Recommended weights for vision-aligned reward diagnostics:**
 
 ```python
 from src.traffic_env.config import RewardConfig
@@ -287,16 +253,26 @@ from src.traffic_env.config import RewardConfig
 vision_weights = RewardConfig(weights={
     "queue":            -1.0,
     "pressure":         -0.5,
-    "throughput":        0.5,   # reduced: proxy less reliable
+    "throughput":        0.5,   # reduced: stop-line tracker noise under occlusion
     "switch_penalty":   -0.1,
-    "low_speed_penalty": 0.0,   # disabled: speed estimate too noisy
-    "waiting_time":     -0.3,
+    "low_speed_penalty": 0.0,   # disabled: ByteTrack speed estimate too noisy
+    "queue_occupancy":  -0.3,
 })
 ```
 
 ---
 
 ## 6. Change Log
+
+### Revision 1.3.0 (approach-level reward alignment)
+
+| Change | Old behaviour (1.2.0) | Fixed behaviour (1.3.0) |
+|---|---|---|
+| A1 — Approach-level reward | Iterated raw controlled lanes (`lane_ids`, `green_lane_ids`, `red_lane_ids`) — inconsistent with approach-aggregated observations | Every term aggregates controlled lanes into approaches via `group_lanes_by_approach` + `aggregate_approach_metrics` (exact same rule as `ObservationBuilder`: unweighted mean for queue, vehicle-count-weighted mean for speed) |
+| A2 — Approach-exit throughput | Per-lane ID set diffs counted intra-approach lane changes as exits; docstrings claimed SUMO and camera mechanisms were "identical" | Per-approach union ID sets (`Σ_a \|prev_a \ cur_a\|`), so lane changes inside an edge yield 0 exits; camera counterpart documented as stop-line-crossing count on tracked IDs (track disappearance inside ROI ≠ exit); global `getArrived` fallback untouched |
+| A3 — `queue_occupancy` naming | Term documented as "accumulated delay" / keyed `"waiting_time"` despite always using `effective_queue_norm` | Documented as mean halted-queue occupancy across approaches; weight key renamed to `"queue_occupancy"` with backward-compatible fallback to legacy `"waiting_time"` |
+| A5 — Privileged-reward ablation | Only observation-restriction arm existed (`--obs-mode privileged`) | Added `--reward-preset privileged` (`RewardConfig.privileged_reward=True`): keeps 26-dim camera obs with exact per-lane simulator queue/pressure/waiting and global arrival throughput |
+| V1 — Camera stop-line exits | `src/vision/state_extractor.py` had no exit counting | Added `LaneROI.stop_line` + directed bottom-centre crossing counter (`min_track_frames=3`, single count per ID, exposed via `get_step_exits()` and `build_state(..., return_info=True)`) |
 
 ### Revision 1.2.0 (2026-06-12, W5 campaign)
 
@@ -316,7 +292,7 @@ vision_weights = RewardConfig(weights={
 
 | Issue | Old behaviour | Fixed behaviour |
 |---|---|---|
-| `waiting_penalty` formula | Multiplied by `step_length/max_green` → max ≤ 0.083 | Direct `waiting_time_norm` or queue proxy; range `[0, 1]` |
+| `waiting_penalty` formula | Multiplied by `step_length/max_green` → max ≤ 0.083 | Direct `effective_queue_norm` proxy; range `[0, 1]` |
 | `_prev_passed_total` side-effect | Always mutated even when caller supplied `prev_passed` | Only mutated when caller does **not** supply `prev_passed` |
 | Double-counting queue | `queue_penalty` + `high_queue_penalty` both used `effective_queue_norm` | `high_queue_penalty` removed; replaced by `pressure_penalty` |
 | Linear queue penalty | `0.85 × queue + 0.15 × occupancy` (magic numbers) | `mean_queue ** 2` (nonlinear, no magic numbers) |
@@ -349,9 +325,8 @@ for tls_id in self.tls_ids:
 action_info["green_lanes_by_tls"] = green_lanes_by_tls
 ```
 
-Before this fix the pressure reward term was silently inactive in every
-training run — any checkpoint trained before 2026-06-12 (including
-`20260418_215140`) never received the pressure signal.
+`RewardCalculator` groups `green_lanes_by_tls` and `lane_ids_by_tls` by parent
+edge so pressure operates on the TLS's group A/B approaches.
 
 ---
 
@@ -366,7 +341,7 @@ DEFAULT_REWARD_WEIGHTS = {
     "throughput":        1.0,
     "switch_penalty":   -0.1,
     "low_speed_penalty":-0.2,
-    "waiting_time":     -0.3,
+    "queue_occupancy":  -0.3,   # legacy alias "waiting_time" still accepted
 }
 
 @dataclass
@@ -379,6 +354,9 @@ class RewardConfig:
     low_speed_threshold:      float = 0.20   # normalised speed below which penalty applies
     jam_speed_threshold:      float = 0.50   # informational; not used in reward
     jam_queue_threshold:      float = 0.50   # informational; not used in reward
+    pressure_signed:          bool  = True
+    queue_mean_of_squares:    bool  = True
+    privileged_reward:        bool  = False   # --reward-preset privileged ablation (26-dim camera obs, exact SUMO reward)
 ```
 
 ---

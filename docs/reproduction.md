@@ -6,8 +6,10 @@ are what `build_paper_artifacts.py` does for you.
 
 > Prereq: `pip install -r requirements.txt`, `SUMO_HOME` set, networks +
 > demand generated (`scripts/generate_networks.py`, `scripts/generate_demand.py`).
-> Schema/reward version is `1.2.0` (post lane-dedup fix, 2026-06-14) — do **not**
-> pool results with the pre-fix pilots.
+> Schema/reward version is **1.3.0** — all paper results require
+> `env_cfg.version >= 1.3.0` (enforced by `PolicyLoader` and `eval_compare.py`).
+> All 1.2.0-era and pre-1.2.0 checkpoints are invalid for paper results and must
+> not be pooled.
 
 ---
 
@@ -45,8 +47,14 @@ This discovers per-seed checkpoints and runs steps 3–6 below. Re-run with
 ### 3. Evaluation (what build does) — `eval_compare.py`
 Tripinfo-based, multi-seed, per network. Unit of variation for learned methods
 is the **training seed** (each checkpoint averaged over the eval route-seeds);
-baselines vary over route-seeds. Stats: mean ± 95% CI, Mann-Whitney U,
-Holm-Bonferroni, Cohen's d vs `--reference` (default MAPPO proxy).
+baselines vary over route-seeds. Two sensing classes: **camera-deployable**
+(`mappo`, `ippo`, `webster`, `lqi`, `sotl`, `fixed`) vs **instrumented
+references** (`actuated`, canonical Varaiya max-pressure `mp`, and the
+`privileged` privileged-observation reference); `maxpressure` is kept only as a
+deprecated CLI alias for `lqi`. Stats: mean ± 95% CI, Mann-Whitney U,
+Holm-Bonferroni, Cohen's d vs `--reference` (default MAPPO proxy). Checkpoints
+below schema `1.3.0` are refused unless `--allow-legacy-schema` is passed
+(debug only — never for paper runs).
 
 ```bash
 python experiment/runners/eval_compare.py \
@@ -54,17 +62,20 @@ python experiment/runners/eval_compare.py \
   --checkpoint results/paper1_mappo/<camp>/models/n3_grid_mappo_proxy_seed*  \
   --ippo-checkpoint results/paper1_mappo/<camp>/models/n3_grid_ippo_proxy_seed* \
   --privileged-checkpoint results/paper1_mappo/<camp>/models/n3_grid_mappo_privileged_seed* \
-  --methods mappo ippo privileged webster actuated maxpressure sotl fixed \
+  --methods mappo ippo privileged webster lqi sotl fixed actuated mp \
   --seeds 42 123 456 789 1337
-# -> results/paper1_mappo/eval_tables/n3_grid_<ts>/{summary.json, table.csv}
+# -> results/paper1_mappo/eval_tables/n3_grid_<ts>/{summary.json, table.csv, raw_samples.csv, green_durations.csv}
 ```
-(`--checkpoint` accepts a file, a directory, or a glob; multiple → per-seed CI.)
+(`--checkpoint` accepts a file, a directory, or a glob; multiple → per-seed CI.
+`raw_samples.csv` logs per-seed episode metrics; `green_durations.csv` logs
+realized green durations across all controllers to verify `min_green=15 s` /
+`max_green=60 s`.)
 
 ### 4. LaTeX tables — `make_tables.py`
 ```bash
 python experiment/runners/make_tables.py --auto
 # -> figures/tables/<scenario>_main.tex            (TABLE-4 / TABLE-5)
-#    figures/tables/<scenario>_restriction_cost.tex (TABLE-6, if priv arm present)
+#    figures/tables/<scenario>_restriction_cost.tex (TABLE-6, if privileged-observation reference arm present)
 # \usepackage{booktabs};  \input{figures/tables/n3_grid_main.tex}
 ```
 
@@ -121,13 +132,14 @@ python experiment/runners/eval_noise_robustness.py \
 Train the ablation arms (reward + observation variants), then eval them. The
 launcher names ablation jobs with a suffix so they stay out of the main set.
 ```bash
-# reward ablations (≥3 seeds) on n3, retrained:
+# reward ablations (≥3 seeds) on n3, retrained (includes privileged-reward arm:
+# 26-dim camera obs + exact-simulator reward):
 python scripts/parallel_launcher.py --networks n3_grid --seeds 42 123 456 \
-  --reward-presets full no_pressure no_throughput queue_only unsigned_pressure mean_then_square
+  --reward-presets full no_pressure no_throughput queue_only unsigned_pressure mean_then_square no_delay no_low_speed privileged
 # observation ablations:
 python scripts/parallel_launcher.py --networks n3_grid --seeds 42 123 456 \
   --obs-ablations no_class_shares no_pressure_feature lane_truncated
-# eval one ablation family (point --checkpoint at the suffixed job dirs):
+# eval one ablation family (point --checkpoint at the suffixed job dirs, e.g. r-no_pressure or r-privileged):
 python experiment/runners/eval_compare.py --network n3_grid --methods mappo \
   --checkpoint "results/paper1_mappo/<camp>/models/n3_grid_mappo_proxy_r-no_pressure_seed*"
 ```
@@ -146,7 +158,7 @@ python scripts/generate_ood_scenarios.py            # n2 + n3: OOD + moto sweep 
 python experiment/runners/eval_compare.py \
   --sumo-cfg sumo_configs/networks/n3_grid/sumo_config_ood_high.sumocfg \
   --lane-groups sumo_configs/networks/n3_grid/lane_groups.json \
-  --checkpoint "results/paper1_mappo/<camp>/models/n3_grid_mappo_proxy_seed*" --methods mappo webster actuated maxpressure sotl fixed
+  --checkpoint "results/paper1_mappo/<camp>/models/n3_grid_mappo_proxy_seed*" --methods mappo webster lqi sotl fixed actuated mp
 # moto-share curve (FIG-6a): repeat for sumo_config_moto{50,73,90}.sumocfg
 ```
 

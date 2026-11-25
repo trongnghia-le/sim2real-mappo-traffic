@@ -667,6 +667,13 @@ def _validate_lane_groups_on_net(
     return failures + net_failures
 
 
+EXPECTED_NETWORK_TLS: Dict[str, int] = {
+    "n2_corridor": 5,
+    "n3_grid": 16,
+    "n4_irregular": 18,
+}
+
+
 def check_topology() -> int:
     """
     CHECK 6 — static lane-group/topology consistency (S3 regression guard).
@@ -675,7 +682,8 @@ def check_topology() -> int:
       1. DEFAULT_MANUAL_LANE_GROUPS (N1) against every legacy net under
          sumo_configs/training and sumo_configs/evaluation/*.
       2. Every generated sumo_configs/networks/*/lane_groups.json against
-         its own sibling intersections.net.xml (N1/N2/N3 scaled networks).
+         its own sibling intersections.net.xml (N1/N2/N3/N4 scaled networks),
+         and asserts required networks match EXPECTED_NETWORK_TLS counts.
     """
     print("\n" + "=" * 70)
     print("CHECK 6 — LANE-GROUP TOPOLOGY: manual groups vs SUMO net files")
@@ -693,11 +701,13 @@ def check_topology() -> int:
             label=str(net_path.relative_to(ROOT)),
         )
 
-    # 2. generated per-network groups (n1 / n2_corridor / n3_grid / ...)
+    # 2. generated per-network groups (n1 / n2_corridor / n3_grid / n4_irregular / ...)
+    seen_networks: Dict[str, int] = {}
     for groups_path in sorted((ROOT / "sumo_configs" / "networks").glob("*/lane_groups.json")):
+        net_name = groups_path.parent.name
         net_path = groups_path.parent / "intersections.net.xml"
         if not net_path.exists():
-            _row(False, f"{groups_path.parent.name}", "lane_groups.json without intersections.net.xml")
+            _row(False, f"{net_name}", "lane_groups.json without intersections.net.xml")
             failures += 1
             continue
         try:
@@ -708,12 +718,23 @@ def check_topology() -> int:
                 for tls_id, pair in data.get("lane_groups", {}).items()
             }
         except Exception as exc:
-            _row(False, f"{groups_path.parent.name}: parse lane_groups.json", str(exc))
+            _row(False, f"{net_name}: parse lane_groups.json", str(exc))
             failures += 1
             continue
+        seen_networks[net_name] = len(groups)
         failures += _validate_lane_groups_on_net(
-            net_path, groups, label=f"networks/{groups_path.parent.name}"
+            net_path, groups, label=f"networks/{net_name}"
         )
+
+    for net_name, expected_tls in EXPECTED_NETWORK_TLS.items():
+        actual_tls = seen_networks.get(net_name)
+        if actual_tls is None:
+            _row(False, f"networks/{net_name} registered", "missing lane_groups.json")
+            failures += 1
+        elif actual_tls != expected_tls:
+            _row(False, f"networks/{net_name} TLS count",
+                 f"got {actual_tls}, expected {expected_tls}")
+            failures += 1
 
     print(f"\n  -> Topology check: {failures} failure(s)")
     return failures

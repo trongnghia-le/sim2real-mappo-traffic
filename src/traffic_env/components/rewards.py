@@ -5,49 +5,67 @@ rewards.py
 ==========
 Per-agent reward calculator for MAPPO traffic-signal control.
 
-Reward signal (reward revision 1.2.0)
--------------------------------------
-R(t) = w_q  · queue_penalty(t)      — mean of SQUARED lane queues    [0, 1]
-     + w_pr · pressure_penalty(t)   — SIGNED phase-aware imbalance   [-1, 1]
-     + w_t  · throughput_reward(t)  — LOCAL lane-exit count          [0, 1]
-     + w_s  · switch_penalty(t)     — phase-switching cost           [0, ∞)
-     + w_sp · low_speed_penalty(t)  — mean speed below threshold     [0, thr]
-     + w_w  · waiting_penalty(t)    — accumulated delay              [0, 1]
+Reward signal (reward revision 1.3.0 — approach-level)
+------------------------------------------------------
+Every term operates on APPROACH aggregates (controlled lanes grouped by parent
+edge via ``group_lanes_by_approach`` and aggregated with
+``aggregate_approach_metrics`` — the exact same rule used by
+``ObservationBuilder``: unweighted mean for queue/occupancy, vehicle-count-
+weighted mean for speed):
+
+R(t) = w_q  · queue_penalty(t)           — mean of SQUARED approach queues   [0, 1]
+     + w_pr · pressure_penalty(t)        — SIGNED approach-group imbalance   [-1, 1]
+     + w_t  · throughput_reward(t)       — LOCAL approach-exit count         [0, 1]
+     + w_s  · switch_penalty(t)          — phase-switching cost              [0, ∞)
+     + w_sp · low_speed_penalty(t)       — mean approach speed below thr     [0, thr]
+     + w_w  · queue_occupancy_penalty(t) — mean halted-queue occupancy       [0, 1]
 
 With default weights (queue=-1, pressure=-0.5, throughput=+1, switch=-0.1,
-low_speed=-0.2, waiting=-0.3) the raw range is [-1.94, +1.50], matching the
-clip range [-2.0, +1.5] in RewardConfig.
+low_speed=-0.2, queue_occupancy=-0.3) the raw range is [-1.94, +1.50],
+matching the clip range [-2.0, +1.5] in RewardConfig.
+
+1.3.0 changes (approach-level reward alignment)
+-----------------------------------------------
+- All reward terms now operate on per-approach aggregates matching the
+  observation builder (no raw per-lane quantities, which are unrecoverable by
+  a roadside camera in motorcycle-dominant mixed traffic).
+- throughput_reward: per-lane ID diffs -> per-APPROACH vehicle-ID set diffs
+  where each approach's set is the union of IDs across all lanes of that edge.
+  A vehicle changing lanes within the same approach edge is no longer counted
+  as an exit. On the camera side the counterpart is a stop-line-crossing count
+  on tracked IDs (a track disappearing inside the ROI is NOT an exit). The
+  global ``getArrived`` delta path is kept unchanged as automatic fallback.
+- queue_occupancy (weight key renamed from ``waiting_time`` with backward-
+  compatible fallback to ``waiting_time``): documented honestly as mean
+  halted-queue occupancy across approaches, not accumulated delay.
 
 1.2.0 changes (W5 campaign revision)
 ------------------------------------
-- queue_penalty: mean(q)^2 -> mean(q^2). Jensen: mean(q^2) >= mean(q)^2 with
-  equality only for uniform queues — a single starved/saturated lane can no
-  longer hide behind a low average (anti-starvation).
-- pressure_penalty: one-sided max(red-green, 0) -> SIGNED
-  (sum_red - sum_green) / n_total in [-1, 1]. With a negative weight the
-  agent is penalised for holding green on the emptier side AND rewarded for
-  serving the more congested side — restoring gradient on correct decisions.
-- throughput_reward: global network arrival delta (split across agents,
-  high variance, diluted credit) -> LOCAL per-agent lane-exit count from
-  per-lane vehicle-ID set differences. This also aligns training exactly
-  with the documented vision proxy (ROI exit events). The global-delta path
-  is kept as an automatic fallback when lane vehicle IDs are unavailable.
+- queue_penalty: mean(q)^2 -> mean(q^2) (anti-starvation, Jensen).
+- pressure_penalty: one-sided max(red-green, 0) -> SIGNED in [-1, 1].
+- throughput_reward: global arrival delta -> local per-agent exits (global
+  path kept as automatic fallback).
 
-Sim-to-real alignment (SUMO → YOLO + ByteTrack)
-------------------------------------------------
-queue_penalty      effective_queue_norm  → halted-vehicle fraction in ROI
-pressure_penalty   effective_queue_norm  → same, partitioned by phase group
-throughput_reward  lane vehicle-ID exits → track IDs exiting ROI per step
-switch_penalty     action logic          → no vision dependency
-waiting_penalty    effective_queue_norm  → halted-queue proxy (no privileged read)
+Sim-to-real alignment at approach granularity (SUMO ↔ camera)
+-------------------------------------------------------------
+queue_penalty           mean_a(q_a^2) over approach edges      ↔ mean_a(q_a^2) over approach ROIs
+pressure_penalty        signed group A/B approach q_a diff     ↔ signed group A/B ROI q_a diff
+throughput_reward       union-set approach ID diffs            ↔ stop-line crossings on tracked IDs (ROI drop != exit)
+switch_penalty          signal-controller action logic         ↔ identical action logic (no vision dependency)
+low_speed_penalty       mean_a(v_a) count-weighted per edge    ↔ mean_a(v_a) ByteTrack speed per approach ROI
+queue_occupancy_penalty mean_a(q_a) halted-queue occupancy     ↔ mean_a(q_a) halted-vehicle length fraction in ROI
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.traffic_env.components.observations import (
+    aggregate_approach_metrics,
+    group_lanes_by_approach,
+)
 from src.traffic_env.config import TrafficEnvConfig
 
 logger = logging.getLogger(__name__)
@@ -57,10 +75,15 @@ LaneCache   = Mapping[str, LaneMetrics]
 ActionInfo  = Mapping[str, Any]
 RewardDict  = Dict[str, float]
 
+_REWARD_APPROACH_FEATURES: Tuple[str, ...] = (
+    "effective_queue_norm",
+    "avg_speed_norm",
+)
+
 
 @dataclass(slots=True)
 class RewardCalculator:
-    """Compute per-agent rewards from lane-level traffic statistics.
+    """Compute per-agent rewards from approach-aggregated traffic statistics.
 
     Parameters
     ----------
@@ -84,8 +107,8 @@ class RewardCalculator:
     last_reward_details: Dict[str, Dict[str, float]] = field(
         default_factory=dict, init=False
     )
-    # per-lane vehicle-ID sets from the previous step (local throughput, 1.2.0)
-    _prev_lane_vehicle_ids: Dict[str, frozenset] = field(
+    # per-approach vehicle-ID sets from the previous step (local throughput, 1.3.0)
+    _prev_approach_vehicle_ids: Dict[Tuple[str, str], frozenset] = field(
         default_factory=dict, init=False
     )
 
@@ -97,7 +120,7 @@ class RewardCalculator:
         """Reset internal throughput trackers between episodes."""
         self._prev_passed_total = float(prev_passed_total)
         self.last_reward_details = {}
-        self._prev_lane_vehicle_ids = {}
+        self._prev_approach_vehicle_ids = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,12 +137,14 @@ class RewardCalculator:
         Expected ``action_info`` keys
         -----------------------------
         ``lane_ids_by_tls`` / ``controlled_lanes_dict``
-            ``{tls_id: [lane_id, ...]}``  — all controlled lanes per agent.
+            ``{tls_id: [lane_id, ...]}``  — all controlled lanes per agent
+            (grouped by parent edge into approaches before computing terms).
         ``green_lanes_by_tls``  *(optional)*
-            ``{tls_id: [lane_id, ...]}``  — lanes currently showing green.
-            Required to enable ``pressure_penalty``; omit to disable it.
+            ``{tls_id: [lane_id, ...]}``  — lanes currently showing green
+            (group A or B from ``lane_groups``). Required to enable
+            ``pressure_penalty``; omit to disable it.
         ``current_passed`` / ``passed``
-            Cumulative arrived-vehicle count at this step.
+            Cumulative arrived-vehicle count at this step (fallback only).
         ``prev_passed``  *(optional)*
             Previous cumulative count.  If absent, internal tracker is used.
         ``delta_passed``  *(optional)*
@@ -135,50 +160,113 @@ class RewardCalculator:
         if not tls_ids:
             return {}
 
-        lane_ids_by_tls  = self._resolve_lane_ids_by_tls(tls_ids, action_info)
-        green_ids_by_tls = self._resolve_green_lane_ids(tls_ids, action_info, lane_ids_by_tls)
+        external = bool(self.config.observation.use_external_state)
+        privileged_reward = bool(self.config.reward.privileged_reward)
+        lane_ids_by_tls = self._resolve_lane_ids_by_tls(tls_ids, action_info)
+        approaches_by_tls: Dict[str, List[Tuple[str, List[str]]]] = {
+            tls_id: group_lanes_by_approach(
+                lane_ids_by_tls.get(tls_id, ()), external_state=external
+            )
+            for tls_id in tls_ids
+        }
+        green_red_by_tls = self._resolve_green_red_approaches(
+            tls_ids, action_info, approaches_by_tls, external_state=external
+        )
+        green_red_lanes_by_tls = (
+            self._resolve_green_red_lanes(tls_ids, action_info, lane_ids_by_tls)
+            if privileged_reward
+            else {}
+        )
         throughput_delta = self._resolve_throughput_delta(action_info)
         switch_counts    = self._resolve_switch_counts(tls_ids, action_info)
 
-        # 1.2.0: snapshot current per-lane vehicle-ID sets (local throughput).
-        # has_lane_ids is False when the cache carries no ID data (e.g. unit
-        # tests with synthetic metrics) -> global-delta fallback is used.
-        current_ids_by_lane: Dict[str, frozenset] = {}
-        for tls_id in tls_ids:
-            for lane_id in lane_ids_by_tls.get(tls_id, ()):
-                if lane_id in current_ids_by_lane:
-                    continue
-                raw_ids = lane_cache.get(lane_id, {}).get("vehicle_ids")
-                if raw_ids is not None:
-                    current_ids_by_lane[lane_id] = frozenset(str(v) for v in raw_ids)
-        has_lane_ids = bool(current_ids_by_lane)
+        # 1.3.0: snapshot current per-approach vehicle-ID sets (union across
+        # all lanes of each approach edge) so intra-approach lane changes are
+        # not exits. has_approach_ids is False when the cache carries no ID
+        # data (e.g. unit tests with synthetic metrics) -> global fallback.
+        current_ids_by_approach: Dict[Tuple[str, str], frozenset] = {}
+        if not privileged_reward:
+            for tls_id in tls_ids:
+                for approach_key, group_lane_ids in approaches_by_tls[tls_id]:
+                    ids: set[str] = set()
+                    has_key = False
+                    for lane_id in group_lane_ids:
+                        raw_ids = lane_cache.get(lane_id, {}).get("vehicle_ids")
+                        if raw_ids is not None:
+                            has_key = True
+                            ids.update(str(v) for v in raw_ids)
+                    if has_key:
+                        current_ids_by_approach[(tls_id, approach_key)] = frozenset(ids)
+        has_approach_ids = bool(current_ids_by_approach)
 
         rewards: RewardDict = {}
         details: Dict[str, Dict[str, float]] = {}
 
         for tls_id in tls_ids:
-            lane_ids  = lane_ids_by_tls.get(tls_id, ())
-            green_ids = green_ids_by_tls.get(tls_id)   # None → pressure disabled
-            red_ids   = green_ids_by_tls.get(f"_red_{tls_id}")
+            approaches = approaches_by_tls[tls_id]
+            approach_keys = tuple(key for key, _ in approaches)
+            approach_metrics: Dict[str, Dict[str, float]] = {
+                key: aggregate_approach_metrics(
+                    group_lane_ids, lane_cache, _REWARD_APPROACH_FEATURES
+                )
+                for key, group_lane_ids in approaches
+            }
 
-            queue_p      = self._compute_queue_penalty(tls_id, lane_ids, lane_cache)
-            pressure_p   = self._compute_pressure_penalty(tls_id, green_ids, red_ids, lane_cache)
-            if has_lane_ids:
-                throughput_r = self._compute_local_throughput(tls_id, lane_ids, current_ids_by_lane)
+            if privileged_reward:
+                lane_ids = lane_ids_by_tls.get(tls_id, ())
+                green_lanes, red_lanes = green_red_lanes_by_tls[tls_id]
+                queue_p = self._compute_privileged_queue_penalty(
+                    tls_id, lane_ids, lane_cache
+                )
+                pressure_p = self._compute_privileged_pressure_penalty(
+                    tls_id, green_lanes, red_lanes, lane_cache
+                )
+                throughput_r = self._compute_throughput_reward(
+                    tls_id, throughput_delta, len(tls_ids)
+                )
+                queue_occ_p = self._compute_privileged_waiting_penalty(
+                    tls_id, lane_ids, lane_cache
+                )
             else:
-                throughput_r = self._compute_throughput_reward(tls_id, throughput_delta, len(tls_ids))
-            switch_p     = self._compute_switch_penalty(tls_id, switch_counts)
-            low_speed_p  = self._compute_low_speed_penalty(tls_id, lane_ids, lane_cache)
-            waiting_p    = self._compute_waiting_penalty(tls_id, lane_ids, lane_cache)
+                green_approaches, red_approaches = green_red_by_tls[tls_id]
+                queue_p = self._compute_queue_penalty(
+                    tls_id, approach_keys, approach_metrics
+                )
+                pressure_p = self._compute_pressure_penalty(
+                    tls_id, green_approaches, red_approaches, approach_metrics
+                )
+                if has_approach_ids:
+                    throughput_r = self._compute_local_throughput(
+                        tls_id, approach_keys, current_ids_by_approach
+                    )
+                else:
+                    throughput_r = self._compute_throughput_reward(
+                        tls_id, throughput_delta, len(tls_ids)
+                    )
+                queue_occ_p = self._compute_queue_occupancy_penalty(
+                    tls_id, approach_keys, approach_metrics
+                )
+
+            switch_p = self._compute_switch_penalty(tls_id, switch_counts)
+            low_speed_p = self._compute_low_speed_penalty(
+                tls_id, approach_keys, approach_metrics
+            )
 
             w = self.config.reward.weights
+            # Backward-compatible lookup: prefer 1.3.0 "queue_occupancy",
+            # fall back to legacy "waiting_time" from pre-1.3.0 run configs.
+            queue_occ_w = (
+                self._weight(w, "queue_occupancy")
+                if "queue_occupancy" in w
+                else self._weight(w, "waiting_time")
+            )
             raw = (
-                self._weight(w, "queue")           * queue_p
-                + self._weight(w, "pressure")      * pressure_p
-                + self._weight(w, "throughput")    * throughput_r
-                + self._weight(w, "switch_penalty")* switch_p
-                + self._weight(w, "low_speed_penalty") * low_speed_p
-                + self._weight(w, "waiting_time")  * waiting_p
+                self._weight(w, "queue")              * queue_p
+                + self._weight(w, "pressure")         * pressure_p
+                + self._weight(w, "throughput")       * throughput_r
+                + self._weight(w, "switch_penalty")   * switch_p
+                + self._weight(w, "low_speed_penalty")* low_speed_p
+                + queue_occ_w                         * queue_occ_p
             )
 
             scaled  = float(raw * self.config.reward.reward_scale)
@@ -190,24 +278,25 @@ class RewardCalculator:
 
             rewards[tls_id] = clipped
             details[tls_id] = {
-                "queue_penalty":     queue_p,
-                "pressure_penalty":  pressure_p,
-                "throughput_reward": throughput_r,
-                "switch_penalty":    switch_p,
-                "low_speed_penalty": low_speed_p,
-                "waiting_penalty":   waiting_p,
-                "raw_reward":        raw,
-                "scaled_reward":     scaled,
-                "clipped_reward":    clipped,
+                "queue_penalty":           queue_p,
+                "pressure_penalty":        pressure_p,
+                "throughput_reward":       throughput_r,
+                "switch_penalty":          switch_p,
+                "low_speed_penalty":       low_speed_p,
+                "queue_occupancy_penalty": queue_occ_p,
+                "waiting_penalty":         queue_occ_p,  # legacy alias (pre-1.3.0)
+                "raw_reward":              raw,
+                "scaled_reward":           scaled,
+                "clipped_reward":          clipped,
             }
             logger.debug(
-                "[%s] r=%.4f  q=%.3f pr=%.3f tp=%.3f sw=%.3f sp=%.3f wt=%.3f",
+                "[%s] r=%.4f  q=%.3f pr=%.3f tp=%.3f sw=%.3f sp=%.3f qo=%.3f",
                 tls_id, clipped, queue_p, pressure_p, throughput_r,
-                switch_p, low_speed_p, waiting_p,
+                switch_p, low_speed_p, queue_occ_p,
             )
 
-        if has_lane_ids:
-            self._prev_lane_vehicle_ids = current_ids_by_lane
+        if has_approach_ids:
+            self._prev_approach_vehicle_ids = current_ids_by_approach
 
         self.last_reward_details = details
         return rewards
@@ -219,33 +308,33 @@ class RewardCalculator:
     def _compute_queue_penalty(
         self,
         tls_id: str,
-        lane_ids: Sequence[str],
-        lane_cache: LaneCache,
+        approach_keys: Sequence[str],
+        approach_metrics: Mapping[str, Mapping[str, float]],
     ) -> float:
-        """Nonlinear congestion penalty across all controlled lanes.
+        """Nonlinear congestion penalty across all controlled approaches.
 
-        Formula (1.2.0): ``mean(effective_queue_norm ** 2)``  — mean of
-        squares, NOT square of the mean. By Jensen's inequality
-        mean(q^2) >= mean(q)^2 with equality only when all lanes are equal,
-        so one saturated lane among many empty ones is penalised heavily
-        instead of being averaged away (anti-starvation guard). Output stays
-        in [0, 1] and keeps the near-zero free-flow / strong-congestion
-        gradient profile of the previous formulation.
+        Formula (1.3.0): ``mean_a(q_a ** 2)`` where ``q_a`` is the approach-
+        aggregated ``effective_queue_norm`` (unweighted mean over the approach's
+        lanes, matching ``ObservationBuilder``). By Jensen's inequality
+        mean(q_a^2) >= mean(q_a)^2 with equality only when all approaches are
+        equal, so one saturated approach among empty ones is penalised heavily
+        instead of being averaged away (anti-starvation guard). Output stays in
+        [0, 1].
 
         Returns
         -------
         float in [0, 1]
         """
-        if not lane_ids:
-            logger.debug("[%s] queue_penalty: no lane_ids → 0.0", tls_id)
+        if not approach_keys:
+            logger.debug("[%s] queue_penalty: no approaches → 0.0", tls_id)
             return 0.0
 
         q_vals = [
-            self._safe_metric(lane_cache.get(lid, {}), "effective_queue_norm")
-            for lid in lane_ids
+            self._safe_metric(approach_metrics.get(key, {}), "effective_queue_norm")
+            for key in approach_keys
         ]
-        # 1.2.0 default: mean(q^2) (anti-starvation). Ablation queue_mean_of_squares=False
-        # reverts to the pre-1.2.0 mean(q)^2 (single-lane starvation averaged away).
+        # Default: mean_a(q_a^2) (anti-starvation). Ablation
+        # queue_mean_of_squares=False reverts to (mean_a(q_a))^2.
         if self.config.reward.queue_mean_of_squares:
             value = float(np.mean(np.square(q_vals)))
         else:
@@ -260,83 +349,92 @@ class RewardCalculator:
     def _compute_pressure_penalty(
         self,
         tls_id: str,
-        green_lane_ids: Optional[Sequence[str]],
-        red_lane_ids: Optional[Sequence[str]],
-        lane_cache: LaneCache,
+        green_approaches: Optional[Sequence[str]],
+        red_approaches: Optional[Sequence[str]],
+        approach_metrics: Mapping[str, Mapping[str, float]],
     ) -> float:
-        """SIGNED phase-aware queue-imbalance term (1.2.0, PRESSLIGHT-inspired).
+        """SIGNED phase-aware approach queue-imbalance term (1.3.0, PRESSLIGHT-inspired).
 
-        Pressure = (Σ queue_norm over red lanes − Σ queue_norm over green lanes)
-                   / total_lanes              ∈ [-1, 1]
+        Pressure = (Σ_{a ∈ red} q_a − Σ_{a ∈ green} q_a) / n_approaches  ∈ [-1, 1]
 
-        Positive  → the currently-red lanes carry more queue than the green
-                    ones: green is being held on the wrong direction. With
-                    the negative weight (-0.5) this is a penalty.
-        Negative  → green is correctly serving the more congested side; the
-                    negative weight turns this into a positive reward, giving
-                    gradient on CORRECT decisions too (the previous one-sided
-                    max(·, 0) form was silent whenever allocation was right).
+        Green/red membership follows the TLS's group A/B approaches from
+        ``lane_groups``.
 
-        Returns 0.0 (neutral) when phase-lane information is absent from
+        Positive  → red approaches carry more queue than green approaches:
+                    green is held on the wrong direction. With the negative
+                    weight (-0.5) this is a penalty.
+        Negative  → green serves the more congested approaches; the negative
+                    weight turns this into a positive reward.
+
+        Returns 0.0 (neutral) when phase-group information is absent from
         ``action_info``.
 
         Returns
         -------
         float in [-1, 1]
         """
-        if not green_lane_ids or not red_lane_ids:
-            logger.debug("[%s] pressure_penalty: phase lanes unavailable → 0.0", tls_id)
+        if not green_approaches or not red_approaches:
+            logger.debug("[%s] pressure_penalty: phase approaches unavailable → 0.0", tls_id)
             return 0.0
 
         sum_green = sum(
-            self._safe_metric(lane_cache.get(lid, {}), "effective_queue_norm")
-            for lid in green_lane_ids
+            self._safe_metric(approach_metrics.get(key, {}), "effective_queue_norm")
+            for key in green_approaches
         )
         sum_red = sum(
-            self._safe_metric(lane_cache.get(lid, {}), "effective_queue_norm")
-            for lid in red_lane_ids
+            self._safe_metric(approach_metrics.get(key, {}), "effective_queue_norm")
+            for key in red_approaches
         )
-        n_total = max(len(green_lane_ids) + len(red_lane_ids), 1)
-        raw = (sum_red - sum_green) / n_total
-        # 1.2.0 default: SIGNED in [-1,1] (gradient on correct decisions too).
-        # Ablation pressure_signed=False reverts to the pre-1.2.0 one-sided
-        # max(red-green, 0) (zero gradient whenever allocation is already correct).
+        n_approaches = max(len(green_approaches) + len(red_approaches), 1)
+        raw = (sum_red - sum_green) / n_approaches
+        # Default: SIGNED in [-1,1] (gradient on correct decisions too).
+        # Ablation pressure_signed=False reverts to one-sided max(raw, 0).
         if not self.config.reward.pressure_signed:
             raw = max(raw, 0.0)
         result = float(np.clip(raw, -1.0, 1.0))
         logger.debug(
             "[%s] pressure_penalty=%.4f (red=%.3f green=%.3f n=%d signed=%s)",
-            tls_id, result, sum_red, sum_green, n_total, self.config.reward.pressure_signed,
+            tls_id, result, sum_red, sum_green, n_approaches, self.config.reward.pressure_signed,
         )
         return result
 
     def _compute_local_throughput(
         self,
         tls_id: str,
-        lane_ids: Sequence[str],
-        current_ids_by_lane: Mapping[str, frozenset],
+        approach_keys: Sequence[str],
+        current_ids_by_approach: Mapping[Tuple[str, str], frozenset],
     ) -> float:
-        """LOCAL per-agent throughput from lane vehicle-ID exits (1.2.0).
+        """LOCAL per-agent throughput from approach vehicle-ID exits (1.3.0).
 
-        exits = Σ over this agent's lanes of |prev_step_ids \\ current_ids| —
-        vehicles that left the approach lane since the last decision step
-        (crossed the stop line, modulo lateral lane-change and rare SUMO-teleport
-        noise — which the deployable ByteTrack ROI-exit proxy shares identically).
-        Normalised by
-        ``throughput_norm_divisor`` and clipped to [0, 1]. No cross-agent
-        splitting: each agent is credited only for traffic it served, which
-        is also exactly the deployable vision proxy (ByteTrack ROI exits).
+        For each controlled approach edge ``a``, the active vehicle set is the
+        union of vehicle IDs across all lanes of ``a``, and
+
+            exits = Σ_a |prev_set_a \\ cur_set_a|.
+
+        Because all lanes of an approach share one set, a vehicle changing
+        lanes inside the same approach edge yields 0 exits; only vehicles that
+        leave the approach edge are counted. Normalised by
+        ``throughput_norm_divisor`` and clipped to [0, 1], with no cross-agent
+        splitting.
+
+        Camera counterpart: a stop-line-crossing count on ByteTrack tracked IDs
+        leaving each approach ROI — a track that disappears inside the ROI
+        (e.g., due to occlusion or tracker drop) is NOT counted as an exit.
+        SUMO set-difference exits and camera stop-line crossings therefore
+        measure the same approach-discharge quantity via distinct mechanisms
+        (not identical implementations).
 
         Returns
         -------
         float in [0, 1]
         """
         exits = 0
-        for lane_id in lane_ids:
-            prev = self._prev_lane_vehicle_ids.get(lane_id)
+        for approach_key in approach_keys:
+            pair = (tls_id, approach_key)
+            prev = self._prev_approach_vehicle_ids.get(pair)
             if prev is None:
                 continue
-            cur = current_ids_by_lane.get(lane_id, frozenset())
+            cur = current_ids_by_approach.get(pair, frozenset())
             exits += len(prev - cur)
 
         norm = exits / max(self.config.reward.throughput_norm_divisor, 1.0)
@@ -392,27 +490,28 @@ class RewardCalculator:
     def _compute_low_speed_penalty(
         self,
         tls_id: str,
-        lane_ids: Sequence[str],
-        lane_cache: LaneCache,
+        approach_keys: Sequence[str],
+        approach_metrics: Mapping[str, Mapping[str, float]],
     ) -> float:
-        """Penalise mean lane speed below the configured threshold.
+        """Penalise mean approach speed below the configured threshold.
 
-        Uses ``avg_speed_norm`` (speed / speed_cap) from lane_cache.  In vision
-        mode this is estimated from ByteTrack pixel displacement and is noisier
-        than SUMO — consider reducing the weight or disabling via weight=0 when
-        deploying with YOLO + ByteTrack.
+        Each approach's ``avg_speed_norm`` is the vehicle-count-weighted mean
+        across its lanes (via ``aggregate_approach_metrics``), and the term
+        takes the unweighted mean across controlled approaches. In vision mode
+        this is estimated from ByteTrack pixel displacement and is noisier than
+        SUMO — consider reducing or zeroing its weight for vision deployment.
 
         Returns
         -------
         float in [0, config.reward.low_speed_threshold]
         """
-        if not lane_ids:
-            logger.debug("[%s] low_speed_penalty: no lane_ids → 0.0", tls_id)
+        if not approach_keys:
+            logger.debug("[%s] low_speed_penalty: no approaches → 0.0", tls_id)
             return 0.0
 
         speed_vals = [
-            self._safe_metric(lane_cache.get(lid, {}), "avg_speed_norm")
-            for lid in lane_ids
+            self._safe_metric(approach_metrics.get(key, {}), "avg_speed_norm")
+            for key in approach_keys
         ]
         mean_speed = float(np.mean(speed_vals))
         threshold  = float(self.config.reward.low_speed_threshold)
@@ -420,46 +519,124 @@ class RewardCalculator:
         logger.debug("[%s] low_speed_penalty=%.4f (mean_spd=%.4f)", tls_id, result, mean_speed)
         return result
 
-    def _compute_waiting_penalty(
+    def _compute_queue_occupancy_penalty(
         self,
         tls_id: str,
-        lane_ids: Sequence[str],
-        lane_cache: LaneCache,
+        approach_keys: Sequence[str],
+        approach_metrics: Mapping[str, Mapping[str, float]],
     ) -> float:
-        """Accumulated-delay penalty — fully camera-computable (no privileged read).
+        """Mean halted-queue occupancy across controlled approaches (linear).
 
-        The environment never populates ``waiting_time_norm`` in the lane cache:
-        neither the proxy nor the privileged builder writes it (the privileged arm
-        emits ``privileged_waiting_norm``, namespaced so the reward stays identical
-        across arms). By default this term is therefore the mean
-        ``effective_queue_norm`` (halted-queue fraction) over the agent's lanes — a
-        linear delay proxy directly measurable from ByteTrack, complementing the
-        quadratic anti-starvation queue penalty. The ``waiting_time_norm`` branch is
-        a latent hook for optional privileged-reward experiments only; it is unused
-        in both the proxy and privileged training arms.
+        Computes ``mean_a(q_a)`` where ``q_a`` is each approach's aggregated
+        ``effective_queue_norm`` (halted-vehicle length fraction, unweighted
+        mean over the approach's lanes). This is a linear halted-queue
+        occupancy penalty — NOT accumulated vehicle delay — complementing the
+        quadratic anti-starvation ``queue_penalty`` (``mean_a(q_a^2)``). It is
+        fully camera-computable with zero privileged simulator reads.
 
-        The earlier ``step_length / max_green_time`` scaling (which capped the
-        output at ≤ 0.083 and made the term negligible) is removed — value in [0, 1].
+        (Renamed from ``waiting_penalty`` / ``waiting_time`` in revision 1.3.0;
+        weight lookup keeps ``waiting_time`` as a backward-compatible alias.)
 
         Returns
         -------
         float in [0, 1]
         """
-        if not lane_ids:
-            logger.debug("[%s] waiting_penalty: no lane_ids → 0.0", tls_id)
+        if not approach_keys:
+            logger.debug("[%s] queue_occupancy_penalty: no approaches → 0.0", tls_id)
             return 0.0
 
-        scores: list[float] = []
-        for lid in lane_ids:
-            m  = lane_cache.get(lid, {})
-            wt = self._safe_metric(m, "waiting_time_norm", default=-1.0)
-            scores.append(
-                wt if wt >= 0.0
-                else self._safe_metric(m, "effective_queue_norm")
-            )
+        q_vals = [
+            self._safe_metric(approach_metrics.get(key, {}), "effective_queue_norm")
+            for key in approach_keys
+        ]
+        result = float(np.clip(np.mean(q_vals), 0.0, 1.0))
+        logger.debug("[%s] queue_occupancy_penalty=%.4f", tls_id, result)
+        return result
 
-        result = float(np.clip(np.mean(scores), 0.0, 1.0))
-        logger.debug("[%s] waiting_penalty=%.4f", tls_id, result)
+    # ------------------------------------------------------------------
+    # Privileged-reward components (A5: exact SUMO quantities per lane)
+    # ------------------------------------------------------------------
+
+    def _compute_privileged_queue_penalty(
+        self,
+        tls_id: str,
+        lane_ids: Sequence[str],
+        lane_cache: LaneCache,
+    ) -> float:
+        """Per-lane exact halted-vehicle count penalty (``privileged_halt_count_norm``)."""
+        if not lane_ids:
+            return 0.0
+        q_vals = [
+            self._safe_metric(lane_cache.get(lid, {}), "privileged_halt_count_norm")
+            for lid in lane_ids
+        ]
+        if self.config.reward.queue_mean_of_squares:
+            value = float(np.mean(np.square(q_vals)))
+        else:
+            value = float(np.square(np.mean(q_vals)))
+        return float(np.clip(value, 0.0, 1.0))
+
+    def _compute_privileged_pressure_penalty(
+        self,
+        tls_id: str,
+        green_lanes: Optional[Sequence[str]],
+        red_lanes: Optional[Sequence[str]],
+        lane_cache: LaneCache,
+    ) -> float:
+        """Per-lane signed pressure from exact halted-vehicle counts."""
+        if not green_lanes or not red_lanes:
+            return 0.0
+        sum_green = sum(
+            self._safe_metric(lane_cache.get(lid, {}), "privileged_halt_count_norm")
+            for lid in green_lanes
+        )
+        sum_red = sum(
+            self._safe_metric(lane_cache.get(lid, {}), "privileged_halt_count_norm")
+            for lid in red_lanes
+        )
+        n_lanes = max(len(green_lanes) + len(red_lanes), 1)
+        raw = (sum_red - sum_green) / n_lanes
+        if not self.config.reward.pressure_signed:
+            raw = max(raw, 0.0)
+        return float(np.clip(raw, -1.0, 1.0))
+
+    def _compute_privileged_waiting_penalty(
+        self,
+        tls_id: str,
+        lane_ids: Sequence[str],
+        lane_cache: LaneCache,
+    ) -> float:
+        """Mean exact accumulated waiting time across controlled lanes."""
+        if not lane_ids:
+            return 0.0
+        w_vals = [
+            self._safe_metric(lane_cache.get(lid, {}), "privileged_waiting_norm")
+            for lid in lane_ids
+        ]
+        return float(np.clip(np.mean(w_vals), 0.0, 1.0))
+
+    def _resolve_green_red_lanes(
+        self,
+        tls_ids: Sequence[str],
+        action_info: ActionInfo,
+        lane_ids_by_tls: Mapping[str, Tuple[str, ...]],
+    ) -> Dict[str, Tuple[Optional[Tuple[str, ...]], Optional[Tuple[str, ...]]]]:
+        """Resolve per-lane green and red partitions for privileged pressure."""
+        green_info = action_info.get("green_lanes_by_tls")
+        if not isinstance(green_info, Mapping):
+            return {tls_id: (None, None) for tls_id in tls_ids}
+
+        result: Dict[str, Tuple[Optional[Tuple[str, ...]], Optional[Tuple[str, ...]]]] = {}
+        for tls_id in tls_ids:
+            raw = green_info.get(tls_id)
+            if isinstance(raw, (list, tuple)):
+                green_set = {str(x) for x in raw}
+                all_lanes = lane_ids_by_tls.get(tls_id, ())
+                green = tuple(lid for lid in all_lanes if lid in green_set)
+                red = tuple(lid for lid in all_lanes if lid not in green_set)
+                result[tls_id] = (green, red)
+            else:
+                result[tls_id] = (None, None)
         return result
 
     # ------------------------------------------------------------------
@@ -495,41 +672,41 @@ class RewardCalculator:
 
         return {tls_id: () for tls_id in tls_ids}
 
-    def _resolve_green_lane_ids(
+    def _resolve_green_red_approaches(
         self,
         tls_ids: Sequence[str],
         action_info: ActionInfo,
-        lane_ids_by_tls: Dict[str, Tuple[str, ...]],
-    ) -> Dict[str, Optional[Tuple[str, ...]]]:
-        """Resolve green lanes and derive red lanes (complement) per TLS.
+        approaches_by_tls: Mapping[str, Sequence[Tuple[str, List[str]]]],
+        *,
+        external_state: bool = False,
+    ) -> Dict[str, Tuple[Optional[Tuple[str, ...]], Optional[Tuple[str, ...]]]]:
+        """Resolve green approaches and red approaches (complement) per TLS.
 
-        Returns a dict that also stores red lanes under the key
-        ``_red_{tls_id}`` so both sets are available to the caller without
-        an extra pass.
-
-        If ``green_lanes_by_tls`` is absent from action_info, all entries
-        are ``None`` and pressure_penalty returns 0 for every agent.
+        Maps ``green_lanes_by_tls`` (populated from ``lane_groups`` group A/B)
+        to approach keys using the same edge-grouping rule as observations.
+        If ``green_lanes_by_tls`` is absent from ``action_info``, entries are
+        ``(None, None)`` and ``pressure_penalty`` returns 0.0.
         """
-        result: Dict[str, Optional[Tuple[str, ...]]] = {}
         green_info = action_info.get("green_lanes_by_tls")
-
         if not isinstance(green_info, Mapping):
-            for tls_id in tls_ids:
-                result[tls_id] = None
-                result[f"_red_{tls_id}"] = None
-            return result
+            return {tls_id: (None, None) for tls_id in tls_ids}
 
+        result: Dict[str, Tuple[Optional[Tuple[str, ...]], Optional[Tuple[str, ...]]]] = {}
         for tls_id in tls_ids:
             raw = green_info.get(tls_id)
             if isinstance(raw, (list, tuple)):
-                green = tuple(str(x) for x in raw)
-                all_lanes = set(lane_ids_by_tls.get(tls_id, ()))
-                red = tuple(all_lanes - set(green))
-                result[tls_id]              = green
-                result[f"_red_{tls_id}"]   = red
+                green_keys = {
+                    key
+                    for key, _ in group_lanes_by_approach(
+                        tuple(str(x) for x in raw), external_state=external_state
+                    )
+                }
+                all_keys = [key for key, _ in approaches_by_tls.get(tls_id, ())]
+                green = tuple(key for key in all_keys if key in green_keys)
+                red = tuple(key for key in all_keys if key not in green_keys)
+                result[tls_id] = (green, red)
             else:
-                result[tls_id]              = None
-                result[f"_red_{tls_id}"]   = None
+                result[tls_id] = (None, None)
 
         return result
 

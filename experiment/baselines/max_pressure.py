@@ -61,11 +61,13 @@ DEFAULT_MAX_STEPS = 1080  # 1 episode = 5 400 s simulation time
 
 class MaxPressurePolicy:
     """
-    Stateless Max Pressure controller.
+    Stateless Local Queue-Imbalance (LQI) controller (camera-deployable).
 
-    At each call to ``select_actions`` the policy queries the current
-    lane cache and picks the signal group with higher total pressure.
-    No internal state is needed — all memory lives in the SUMO simulation.
+    Compares the sum of incoming ``effective_queue_norm`` across group A vs
+    group B (no downstream queues). Kept under the class name
+    ``MaxPressurePolicy`` (aliased as ``LQIPolicy``) for backward
+    compatibility; see :class:`CanonicalMaxPressurePolicy` for canonical
+    Varaiya (2013) max-pressure with downstream queues.
 
     Parameters
     ----------
@@ -86,7 +88,7 @@ class MaxPressurePolicy:
         lane_cache: Dict[str, Dict[str, float]],
     ) -> Dict[str, int]:
         """
-        Return {tls_id: action} based on current lane pressures.
+        Return {tls_id: action} based on current incoming queue sums.
 
         action = 0 → group_A gets green (env maps this to green phase index 0)
         action = 1 → group_B gets green (env maps this to green phase index 1)
@@ -107,6 +109,92 @@ class MaxPressurePolicy:
                 for lid in group_b
             )
             actions[tls_id] = 0 if pressure_a >= pressure_b else 1
+        return actions
+
+
+LQIPolicy = MaxPressurePolicy
+
+
+class CanonicalMaxPressurePolicy:
+    """
+    Canonical Max-Pressure controller (Varaiya, 2013) — INSTRUMENTED reference.
+
+    For each phase group (A or B), pressure is the sum over all outgoing
+    movements ``(in_lane -> out_lane)`` discovered via
+    ``traci.lane.getLinks(in_lane)`` of:
+
+        halting_count(in_lane) - halting_count(out_lane)
+
+    using exact SUMO halting vehicle counts (``lane.getLastStepHaltingNumber``).
+    Because downstream queues on outgoing lanes are not observable from a single
+    intersection camera, this controller is classified as an instrumented
+    reference rather than camera-deployable.
+    """
+
+    def __init__(
+        self,
+        lane_groups: Dict[str, Tuple[List[str], List[str]]],
+    ) -> None:
+        self.lane_groups = lane_groups
+        self._movements: Optional[
+            Dict[str, Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]]
+        ] = None
+
+    def reset(self) -> None:
+        """Clear cached movement topology between episodes / connections."""
+        self._movements = None
+
+    def _build_movements(
+        self, sumo_conn
+    ) -> Dict[str, Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]]:
+        movements: Dict[str, Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]] = {}
+        for tls_id, (group_a, group_b) in self.lane_groups.items():
+            pair: List[List[Tuple[str, str]]] = []
+            for group in (group_a, group_b):
+                movs: List[Tuple[str, str]] = []
+                for in_lane in group:
+                    try:
+                        links = sumo_conn.lane.getLinks(in_lane) or ()
+                    except Exception:
+                        links = ()
+                    seen_out: set = set()
+                    for lk in links:
+                        if not lk:
+                            continue
+                        out_lane = str(lk[0]) if lk[0] else ""
+                        if (
+                            out_lane
+                            and not out_lane.startswith(":")
+                            and out_lane not in seen_out
+                        ):
+                            seen_out.add(out_lane)
+                            movs.append((in_lane, out_lane))
+                pair.append(movs)
+            movements[tls_id] = (pair[0], pair[1])
+        return movements
+
+    def select_actions(self, sumo_conn) -> Dict[str, int]:
+        """Return {tls_id: 0|1} maximizing Varaiya movement pressure."""
+        if self._movements is None:
+            self._movements = self._build_movements(sumo_conn)
+
+        halt_cache: Dict[str, float] = {}
+
+        def _halt(lane_id: str) -> float:
+            val = halt_cache.get(lane_id)
+            if val is None:
+                try:
+                    val = float(sumo_conn.lane.getLastStepHaltingNumber(lane_id))
+                except Exception:
+                    val = 0.0
+                halt_cache[lane_id] = val
+            return val
+
+        actions: Dict[str, int] = {}
+        for tls_id, (movs_a, movs_b) in self._movements.items():
+            p_a = sum(_halt(in_l) - _halt(out_l) for in_l, out_l in movs_a)
+            p_b = sum(_halt(in_l) - _halt(out_l) for in_l, out_l in movs_b)
+            actions[tls_id] = 0 if p_a >= p_b else 1
         return actions
 
 

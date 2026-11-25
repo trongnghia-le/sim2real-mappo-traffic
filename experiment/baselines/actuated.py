@@ -8,13 +8,15 @@ for tlLogic type="actuated" — no detector files needed.
 
 What this script does:
   1. Parses the network's static tlLogic programs and derives an actuated
-     twin per junction: green phases get minDur=15 / maxDur=60 (matching the
-     RL env's min/max green), yellows stay fixed at their static duration.
-     Written to <net_dir>/tls_actuated.add.xml.
+     twin per junction: green phases get minDur / maxDur matching the RL
+     env's min/max green (15 s / 60 s by default), yellows stay fixed at
+     their static duration. Written into a temporary directory (never into
+     the repository tree).
   2. Runs the scenario via TraCI with the SAME flags BaseSumoEnv uses
      (--time-to-teleport 160, --waiting-time-memory 1000, ...), switches
      every junction to the "actuated" program, and lets SUMO control.
-  3. Writes tripinfo and prints mean travel time / waiting time / P95 wait.
+  3. Writes tripinfo using the shared experiment.common.tripinfo flags and
+     prints mean travel time / waiting time / P95 wait.
 
 Usage (from project root):
     python experiment/baselines/actuated.py --network n3_grid --seed 42
@@ -29,13 +31,13 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from experiment.common.tripinfo import parse_tripinfo_means
+from experiment.common.tripinfo import parse_tripinfo_means, tripinfo_sumo_args
 
 ENV_PARITY_FLAGS = [
     "--time-to-teleport", "160",
@@ -56,8 +58,18 @@ def _is_yellow(state: str) -> bool:
     return "y" in state.lower()
 
 
-def write_actuated_add(net_path: Path, out_path: Path) -> List[str]:
+def write_actuated_add(
+    net_path: Path,
+    out_path: Path,
+    min_green: float = MIN_GREEN,
+    max_green: float = MAX_GREEN,
+) -> List[str]:
     """Derive type='actuated' twins of every static tlLogic in the net."""
+    min_g = int(round(float(min_green)))
+    max_g = int(round(float(max_green)))
+    if min_g > max_g:
+        raise ValueError(f"min_green ({min_g}) must be <= max_green ({max_g})")
+
     root = ET.parse(net_path).getroot()
     tls_ids: List[str] = []
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<additional>"]
@@ -74,14 +86,15 @@ def write_actuated_add(net_path: Path, out_path: Path) -> List[str]:
             dur = float(phase.get("duration", "30"))
             if _is_green(state):
                 lines.append(
-                    f'        <phase duration="{int(MAX_GREEN)}" state="{state}" '
-                    f'minDur="{int(MIN_GREEN)}" maxDur="{int(MAX_GREEN)}"/>'
+                    f'        <phase duration="{max_g}" state="{state}" '
+                    f'minDur="{min_g}" maxDur="{max_g}"/>'
                 )
             else:
                 # yellows (and any all-red) stay fixed
                 lines.append(f'        <phase duration="{int(dur)}" state="{state}"/>')
         lines.append("    </tlLogic>")
     lines.append("</additional>")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if not tls_ids:
         raise RuntimeError(f"no tlLogic found in {net_path}")
@@ -97,7 +110,13 @@ def run_actuated(
     duration_s: int,
     tripinfo_path: Path,
     extra_args: Optional[List[str]] = None,
-) -> None:
+) -> List[Tuple[str, int, float, bool]]:
+    """Run SUMO actuated control and return realized green durations.
+
+    Returns a list of ``(tls_id, phase, duration_s, completed)`` tuples where
+    ``completed=True`` for phases that transitioned normally and
+    ``completed=False`` for right-censored phases still active at episode end.
+    """
     import traci
 
     cmd = (
@@ -105,31 +124,81 @@ def run_actuated(
         + ENV_PARITY_FLAGS
         # CLI --additional-files REPLACES the cfg value -> must list vtypes too
         + ["--additional-files", f"{vtypes_path},{add_path}"]
-        + ["--tripinfo-output", str(tripinfo_path), "--tripinfo-output.write-unfinished"]
+        + tripinfo_sumo_args(tripinfo_path)
         + list(extra_args or [])
     )
     traci.start(cmd, label="actuated_run")
     conn = traci.getConnection("actuated_run")
+    green_durations: List[Tuple[str, int, float, bool]] = []
     try:
+        green_phase_sets: Dict[str, set] = {}
         for tls_id in tls_ids:
             conn.trafficlight.setProgram(tls_id, "actuated")
+            gset: set = set()
+            try:
+                logics = conn.trafficlight.getAllProgramLogics(tls_id)
+                logic = next((lg for lg in logics if lg.programID == "actuated"), logics[0])
+                for idx, phase in enumerate(logic.getPhases()):
+                    if _is_green(phase.state):
+                        gset.add(idx)
+            except Exception:
+                gset = {0, 2}
+            green_phase_sets[tls_id] = gset or {0, 2}
+
+        try:
+            dt = float(conn.simulation.getDeltaT())
+        except Exception:
+            dt = 1.0
+
+        cur_green_phase: Dict[str, Optional[int]] = {t: None for t in tls_ids}
+        cur_green_dur: Dict[str, float] = {t: 0.0 for t in tls_ids}
+
+        # Step FIRST, then sample getPhase(): at t=0 before the first
+        # simulationStep(), spentDuration is 0.0; after step k (t=k), SUMO has
+        # spent 1 s in the phase reported by getPhase(), matching spentDuration
+        # exactly (e.g. minDur=15 logs 15.0 s, maxDur=60 logs 60.0 s).
         for _ in range(int(duration_s)):
             conn.simulationStep()
+            for tls_id in tls_ids:
+                ph = int(conn.trafficlight.getPhase(tls_id))
+                prev_g = cur_green_phase[tls_id]
+                if ph in green_phase_sets[tls_id]:
+                    if prev_g == ph:
+                        cur_green_dur[tls_id] += dt
+                    else:
+                        if prev_g is not None and cur_green_dur[tls_id] > 0.0:
+                            green_durations.append((tls_id, prev_g, cur_green_dur[tls_id], True))
+                        cur_green_phase[tls_id] = ph
+                        cur_green_dur[tls_id] = dt
+                else:
+                    if prev_g is not None and cur_green_dur[tls_id] > 0.0:
+                        green_durations.append((tls_id, prev_g, cur_green_dur[tls_id], True))
+                    cur_green_phase[tls_id] = None
+                    cur_green_dur[tls_id] = 0.0
+
+        # Right-censored phases still running at episode end -> completed=False
+        for tls_id in tls_ids:
+            prev_g = cur_green_phase[tls_id]
+            if prev_g is not None and cur_green_dur[tls_id] > 0.0:
+                green_durations.append((tls_id, prev_g, cur_green_dur[tls_id], False))
     finally:
         try:
             conn.close()
         except Exception:
             pass
+    return green_durations
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid"], default=None)
+    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"], default=None)
     parser.add_argument("--split", choices=["train", "eval"], default="eval")
     parser.add_argument("--sumo-cfg", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--duration", type=int, default=5400,
                         help="simulation seconds (default: one full episode)")
+    parser.add_argument("--min-green-time", type=float, default=MIN_GREEN)
+    parser.add_argument("--max-green-time", type=float, default=MAX_GREEN)
     parser.add_argument("--out-json", type=str, default=None)
     args = parser.parse_args()
 
@@ -144,19 +213,27 @@ def main() -> None:
     net_dir = sumo_cfg.parent
     net_path = net_dir / "intersections.net.xml"
     vtypes_path = net_dir / "vtypes.add.xml"
-    add_path = net_dir / "tls_actuated.add.xml"
 
-    tls_ids = write_actuated_add(net_path, add_path)
-    print(f"[1/2] actuated programs written for {len(tls_ids)} TLS -> {add_path.name}")
+    with tempfile.TemporaryDirectory(prefix="sumo_actuated_") as tmp_str:
+        tmp_dir = Path(tmp_str)
+        add_path = tmp_dir / "tls_actuated.add.xml"
+        tls_ids = write_actuated_add(
+            net_path,
+            add_path,
+            min_green=args.min_green_time,
+            max_green=args.max_green_time,
+        )
+        print(f"[1/2] actuated programs written for {len(tls_ids)} TLS -> {add_path}")
 
-    tripinfo_path = Path(tempfile.gettempdir()) / f"actuated_tripinfo_{args.seed}.xml"
-    print(f"[2/2] running SUMO actuated for {args.duration}s, seed={args.seed}")
-    run_actuated(sumo_cfg, add_path, vtypes_path, tls_ids, args.seed, args.duration, tripinfo_path)
+        tripinfo_path = tmp_dir / f"actuated_tripinfo_{args.seed}.xml"
+        print(f"[2/2] running SUMO actuated for {args.duration}s, seed={args.seed}")
+        run_actuated(sumo_cfg, add_path, vtypes_path, tls_ids, args.seed, args.duration, tripinfo_path)
 
-    metrics = parse_tripinfo_means(tripinfo_path)
+        metrics = parse_tripinfo_means(tripinfo_path)
+
     print("\n=== SUMO Actuated results ===")
     for key, value in metrics.items():
-        print(f"  {key:>22}: {value:.2f}" if isinstance(value, float) else f"  {key:>22}: {value}")
+        print(f"  {key:>32}: {value:.2f}" if isinstance(value, float) else f"  {key:>32}: {value}")
 
     if args.out_json:
         out = Path(args.out_json)
@@ -166,6 +243,8 @@ def main() -> None:
             "sumo_cfg": str(sumo_cfg),
             "seed": args.seed,
             "duration_s": args.duration,
+            "min_green_time": args.min_green_time,
+            "max_green_time": args.max_green_time,
             "metrics": metrics,
         }, indent=2), encoding="utf-8")
         print(f"\nsaved -> {out}")

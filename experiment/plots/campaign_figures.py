@@ -104,10 +104,12 @@ def _pub_frame(ax) -> None:
     ax.spines["right"].set_visible(False)
 
 
-def _save_pub(fig, stem: str) -> None:
+def _save_pub(fig, stem: str, out_dir: Optional[Path] = None) -> None:
     """Vector PDF (goes into the paper) + SVG + 600-dpi PNG preview."""
+    target_dir = Path(out_dir) if out_dir is not None else OUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     for ext, kw in (("pdf", {}), ("svg", {}), ("png", {"dpi": 600})):
-        out = OUT_DIR / f"{stem}.{ext}"
+        out = target_dir / f"{stem}.{ext}"
         fig.savefig(out, bbox_inches="tight", **kw)
         print(f"[fig] saved {out}")
 
@@ -309,29 +311,14 @@ def fig_convergence(campaign_dir: Path) -> None:
         plt.close(fig)
 
 
-def fig_losses(campaign_dir: Path, arm: str = "mappo_proxy") -> None:
-    """Appendix diagnostics, 2x2 at single-column width (the paper includes it
-    at \\columnwidth): policy loss / value loss (log) / entropy / approx KL,
-    each a single accent line + 95% CI band over seeds. No suptitle — the
-    LaTeX caption carries the description."""
-    _setup_mpl()
+def _render_losses_2x2(
+    upd_jobs: List[Path],
+    stem: str,
+    *,
+    out_dir: Optional[Path] = None,
+) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MultipleLocator
-
-    tblogs = campaign_dir / "tblogs"
-    if not tblogs.exists():
-        print("[fig] losses: no tblogs -- skip")
-        return
-    algo, obs = arm.split("_", 1)
-    upd_jobs: List[Path] = []
-    for job_dir in sorted(tblogs.iterdir()):
-        parsed = parse_job_name(job_dir.name) if job_dir.is_dir() else None
-        if parsed and parsed[1] == algo and parsed[2] == obs:
-            if list(job_dir.glob("**/train_updates.csv")):
-                upd_jobs.append(job_dir)
-    if not upd_jobs:
-        print(f"[fig] losses: no train_updates.csv for {arm} -- skip")
-        return
 
     specs = [("policy_loss", "Policy loss", False, None),
              ("value_loss", "Value loss", True, None),
@@ -371,12 +358,109 @@ def fig_losses(campaign_dir: Path, arm: str = "mappo_proxy") -> None:
             ax.margins(x=0.02)
             if k >= 2:  # bottom row only
                 ax.set_xlabel(r"Steps ($\times 10^3$)", fontsize=7.5)
-        _save_pub(fig, "training_losses")
+        _save_pub(fig, stem, out_dir=out_dir)
         plt.close(fig)
 
 
-def _load_summaries() -> List[dict]:
-    base = RESULTS / "eval_tables"
+def fig_losses(
+    campaign_dir: Path,
+    arm: str = "mappo_proxy",
+    network: Optional[str] = None,
+    out_dir: Optional[Path] = None,
+) -> None:
+    """Appendix diagnostics: policy loss / value loss (log) / entropy / approx KL,
+    grouped strictly per network (never pooled across networks).
+
+    - When ``network`` is given, filters to that network and writes
+      ``training_losses_<network>``.
+    - When ``network`` is None and a single network is present, writes
+      ``training_losses``.
+    - When ``network`` is None and multiple networks are present, writes one
+      per-network 2x2 figure ``training_losses_<net>`` for each network plus a
+      faceted multi-row ``training_losses`` overview (one row per network).
+    """
+    _setup_mpl()
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+
+    tblogs = campaign_dir / "tblogs"
+    if not tblogs.exists():
+        print("[fig] losses: no tblogs -- skip")
+        return
+    algo, obs = arm.split("_", 1)
+    by_net: Dict[str, List[Path]] = {}
+    for job_dir in sorted(tblogs.iterdir()):
+        parsed = parse_job_name(job_dir.name) if job_dir.is_dir() else None
+        if parsed and parsed[1] == algo and parsed[2] == obs:
+            if network is not None and parsed[0] != network:
+                continue
+            if list(job_dir.glob("**/train_updates.csv")):
+                by_net.setdefault(parsed[0], []).append(job_dir)
+    if not by_net:
+        net_desc = f" on {network}" if network else ""
+        print(f"[fig] losses: no train_updates.csv for {arm}{net_desc} -- skip")
+        return
+
+    nets = sorted(by_net)
+    if len(nets) == 1:
+        net = nets[0]
+        stem = f"training_losses_{net}" if network is not None else "training_losses"
+        _render_losses_2x2(by_net[net], stem, out_dir=out_dir)
+        return
+
+    # Multiple networks: emit per-network 2x2 figures AND a faceted overview
+    # (one row per network x 4 loss panels), never pooling across networks.
+    for net in nets:
+        _render_losses_2x2(by_net[net], f"training_losses_{net}", out_dir=out_dir)
+
+    specs = [("policy_loss", "Policy loss", False, None),
+             ("value_loss", "Value loss", True, None),
+             ("entropy", "Entropy", False, None),
+             ("approx_kl", "Approx. KL", False, 0.015)]
+    with plt.rc_context(PUB_RC):
+        fig, axes = plt.subplots(
+            len(nets), len(specs),
+            figsize=(PAGE_W, max(2.2, 1.55 * len(nets))),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        for row_idx, net in enumerate(nets):
+            upd_jobs = by_net[net]
+            for col_idx, (key, label, logy, hline) in enumerate(specs):
+                ax = axes[row_idx][col_idx]
+                band = _multiseed_band(upd_jobs, "train_updates.csv",
+                                       "global_step", key, smooth_w=50)
+                if band is None:
+                    ax.set_visible(False)
+                    continue
+                grid, mean, std = band
+                half = 1.96 * std / np.sqrt(max(len(upd_jobs), 1))
+                _pub_frame(ax)
+                ax.fill_between(grid / 1e3, mean - half, mean + half,
+                                color=BAND, alpha=0.85, lw=0, zorder=1)
+                ax.plot(grid / 1e3, mean, color=ACCENT, lw=1.2, zorder=3)
+                if hline is not None:
+                    ax.axhline(hline, color=REF_C, ls=DASH, lw=0.9, zorder=2)
+                if logy:
+                    ax.set_yscale("log")
+                    col_title = label + " (log)"
+                else:
+                    col_title = label
+                if row_idx == 0:
+                    ax.set_title(col_title, loc="left", pad=3, fontsize=8)
+                if col_idx == 0:
+                    ax.set_ylabel(net, fontsize=7.5)
+                ax.tick_params(labelsize=6.5)
+                ax.xaxis.set_major_locator(MultipleLocator(100))
+                ax.margins(x=0.02)
+                if row_idx == len(nets) - 1:
+                    ax.set_xlabel(r"Steps ($\times 10^3$)", fontsize=7)
+        _save_pub(fig, "training_losses", out_dir=out_dir)
+        plt.close(fig)
+
+
+def _load_summaries(eval_dir: Optional[Path] = None) -> List[dict]:
+    base = Path(eval_dir) if eval_dir is not None else (RESULTS / "eval_tables")
     if not base.exists():
         return []
     by_net: Dict[str, Path] = {}
@@ -392,18 +476,21 @@ def _load_summaries() -> List[dict]:
 # the two secondary learned arms add hatches so B/W print still separates
 # them; ours is the single strong accent.
 METHOD_STYLE = {
-    "fixed":       ("#d9dcdf", None,   "Fixed-Time"),
-    "webster":     ("#bfc4c9", None,   "Webster"),
-    "actuated":    ("#a3aab1", None,   "Actuated"),
-    "sotl":        ("#878f97", None,   "SOTL"),
-    "maxpressure": ("#6b737b", None,   "MaxPressure"),
-    "ippo":        ("#dfa76a", "///",  "IPPO"),
-    "privileged":  ("#a891c4", "\\\\\\", "MAPPO-priv."),
-    "mappo":       (ACCENT,    None,   "MAPPO (ours)"),
+    "fixed":       ("#d9dcdf", None,     "Fixed-Time"),
+    "webster":     ("#bfc4c9", None,     "Webster"),
+    "sotl":        ("#878f97", None,     "SOTL"),
+    "lqi":         ("#6b737b", None,     "LQI"),
+    "maxpressure": ("#6b737b", None,     "LQI"),          # legacy alias
+    "ippo":        ("#dfa76a", "///",    "IPPO"),
+    "mappo":       (ACCENT,    None,     "MAPPO (ours)"),
+    "actuated":    ("#a3aab1", "...",    "Actuated*"),
+    "mp":          ("#555d65", "...",    "Max-Pressure*"),
+    "privileged":  ("#a891c4", "\\\\\\", "MAPPO-priv.*"),
 }
-# canonical left-to-right ordering (baselines first, ours last so it stands out)
-METHOD_ORDER = ["fixed", "webster", "actuated", "sotl", "maxpressure",
-                "ippo", "privileged", "mappo"]
+INSTRUMENTED_METHODS = frozenset({"actuated", "mp", "privileged"})
+# canonical left-to-right ordering: camera-deployable first, instrumented refs after
+METHOD_ORDER = ["fixed", "webster", "sotl", "lqi", "maxpressure", "ippo", "mappo",
+                "actuated", "mp", "privileged"]
 
 
 def _ordered_methods(aggregates) -> list:
@@ -412,7 +499,7 @@ def _ordered_methods(aggregates) -> list:
     return present
 
 
-def fig_comparison() -> None:
+def fig_comparison(eval_dir: Optional[Path] = None) -> None:
     """FIG-4 (VI-A, figure*): grouped bars, one panel per metric with its own
     y-scale. Bars start at zero (honest length encoding), 95% CI whiskers,
     ours + privileged outlined, a dark triangle marks the best method per
@@ -422,7 +509,7 @@ def fig_comparison() -> None:
     import matplotlib.pyplot as plt
     from matplotlib.transforms import offset_copy
 
-    summaries = _load_summaries()
+    summaries = _load_summaries(eval_dir=eval_dir)
     if not summaries:
         print("[fig] comparison: no eval_tables/*/summary.json -- skip")
         return
@@ -479,9 +566,9 @@ def fig_comparison() -> None:
             plt.close(fig)
 
 
-def fig_restriction_cost() -> None:
+def fig_restriction_cost(eval_dir: Optional[Path] = None) -> None:
     plt = _setup_mpl()
-    summaries = _load_summaries()
+    summaries = _load_summaries(eval_dir=eval_dir)
     drawn = False
     for summary in summaries:
         agg = summary["aggregates"]
@@ -512,7 +599,7 @@ def fig_restriction_cost() -> None:
         print("[fig] restriction_cost: need both 'mappo' and 'privileged' arms — skip")
 
 
-def fig_noise() -> None:
+def fig_noise(eval_dir: Optional[Path] = None) -> None:
     """FIG-6 -- sensing-noise robustness, built for an IEEE Transactions page.
 
     Two panels sharing one truncated y-axis:
@@ -547,11 +634,12 @@ def fig_noise() -> None:
     # -- strongest camera-deployable baseline (fallback keeps the fig honest
     #    even when run outside the campaign layout) ----------------------
     ref_val, ref_name = 321.6, "webster"
-    for sj in sorted((RESULTS / "eval_tables").glob("*MERGED*/summary.json")):
+    eval_base = Path(eval_dir) if eval_dir is not None else (RESULTS / "eval_tables")
+    for sj in sorted(eval_base.glob("*MERGED*/summary.json")):
         try:
             agg = json.loads(sj.read_text(encoding="utf-8"))["aggregates"]
             cands = [(agg[m]["mean_travel_time_s"]["mean"], m)
-                     for m in ("webster", "maxpressure", "sotl", "fixed")
+                     for m in ("webster", "lqi", "maxpressure", "sotl", "fixed")
                      if m in agg]
             if cands:
                 ref_val, ref_name = min(cands)
@@ -670,7 +758,7 @@ def fig_noise() -> None:
                    mfc=ACCENT, mec="white", mew=0.8, label="MAPPO proxy (mean)"),
             Patch(fc=BAND, ec="none", label="95% CI (5 seeds)"),
             Line2D([0], [0], color=REF_C, lw=1.2, ls=DASH,
-                   label=f"{ref_name.capitalize()} (best deployable)"),
+                   label=f"{METHOD_STYLE.get(ref_name, (None, None, ref_name.capitalize()))[2]} (best deployable)"),
         ]
         fig.subplots_adjust(bottom=0.30)
         fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False,
@@ -735,6 +823,7 @@ def fig_demand_profile() -> None:
 
 
 def main() -> None:
+    global OUT_DIR
     for _s in (sys.stdout, sys.stderr):
         try:
             _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -746,6 +835,12 @@ def main() -> None:
                    help="campaign dir name under results/paper1_mappo (default: latest)")
     p.add_argument("--arm", type=str, default="mappo_proxy",
                    help="arm for the loss-diagnostics figure")
+    p.add_argument("--network", type=str, default=None,
+                   help="optional network filter for loss-diagnostics figure")
+    p.add_argument("--eval-dir", type=str, default=None,
+                   help="eval_tables dir containing <scenario>_<ts>/summary.json")
+    p.add_argument("--figures-dir", "--out-dir", dest="figures_dir", type=str, default=None,
+                   help="output directory for generated figures (default: figures/)")
     p.add_argument("--all", action="store_true")
     p.add_argument("--convergence", action="store_true")
     p.add_argument("--losses", action="store_true")
@@ -756,7 +851,10 @@ def main() -> None:
     p.add_argument("--demand-profile", action="store_true")
     args = p.parse_args()
 
+    if args.figures_dir:
+        OUT_DIR = Path(args.figures_dir)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    eval_dir = Path(args.eval_dir) if args.eval_dir else None
 
     campaign_dir = None
     if args.campaign_id:
@@ -778,13 +876,13 @@ def main() -> None:
             if want["convergence"]:
                 fig_convergence(campaign_dir)
             if want["losses"]:
-                fig_losses(campaign_dir, arm=args.arm)
+                fig_losses(campaign_dir, arm=args.arm, network=args.network, out_dir=OUT_DIR)
     if want["comparison"]:
-        fig_comparison()
+        fig_comparison(eval_dir=eval_dir)
     if want["restriction_cost"]:
-        fig_restriction_cost()
+        fig_restriction_cost(eval_dir=eval_dir)
     if want["noise"]:
-        fig_noise()
+        fig_noise(eval_dir=eval_dir)
     if want["feature_recovery"]:
         fig_feature_recovery()
     if want["demand_profile"]:

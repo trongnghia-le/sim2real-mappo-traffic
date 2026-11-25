@@ -38,12 +38,14 @@ import json
 import math
 import os
 import random
+import shutil
+import signal
 import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # repo convention: scripts add the project root to sys.path
 # so `python experiment/runners/train_ppo.py` works without pip install -e.
@@ -57,6 +59,21 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+
+def _apply_omp_thread_limit() -> None:
+    """Respect OMP_NUM_THREADS in PyTorch when set (avoids CPU oversubscription)."""
+    omp_threads = os.environ.get("OMP_NUM_THREADS")
+    if omp_threads:
+        try:
+            n_threads = int(omp_threads)
+            if n_threads > 0:
+                torch.set_num_threads(n_threads)
+        except ValueError:
+            pass
+
+
+_apply_omp_thread_limit()
+
 # TensorBoard is optional: on some machines torch.utils.tensorboard pulls in a
 # broken TensorFlow build (NumPy 2.x ABI clash). CSV logging always works.
 try:
@@ -66,22 +83,27 @@ except Exception as _tb_exc:  # pragma: no cover
     SummaryWriter = None  # type: ignore[assignment]
     _TB_IMPORT_ERROR = _tb_exc
 
+from src.core.policy_loader import MIN_SCHEMA_VERSION, validate_checkpoint_schema
 from src.traffic_env.config import build_default_config, load_lane_groups_json, DEFAULT_REWARD_WEIGHTS
 from src.traffic_env.envs.multi_agent import MappoTrafficEnv
 
 
 # ---------------------------------------------------------------------
-# Ablation presets (paper VI-F). Defaults reproduce reward 1.2.0 / schema 1.1.0.
+# Ablation presets (paper VI-F). Defaults reproduce reward 1.3.0 / schema 1.3.0.
 # ---------------------------------------------------------------------
 REWARD_PRESETS = ("full", "no_pressure", "no_throughput", "queue_only",
                   "unsigned_pressure", "mean_then_square", "no_delay",
-                  "no_low_speed")
+                  "no_low_speed", "privileged")
 OBS_ABLATIONS = ("none", "no_class_shares", "no_pressure_feature", "lane_truncated")
 
 
 def _reward_preset_kwargs(preset: str) -> Dict[str, Any]:
     w = dict(DEFAULT_REWARD_WEIGHTS)
-    kw: Dict[str, Any] = {"pressure_signed": True, "queue_mean_of_squares": True}
+    kw: Dict[str, Any] = {
+        "pressure_signed": True,
+        "queue_mean_of_squares": True,
+        "privileged_reward": False,
+    }
     if preset == "full":
         pass
     elif preset == "no_pressure":
@@ -95,9 +117,11 @@ def _reward_preset_kwargs(preset: str) -> Dict[str, Any]:
     elif preset == "mean_then_square":
         kw["queue_mean_of_squares"] = False
     elif preset == "no_delay":
-        w["waiting_time"] = 0.0          # VI-F: drop the linear halted-queue delay proxy (w_w=0)
+        w["queue_occupancy"] = 0.0       # VI-F: drop the linear halted-queue occupancy term (w_w=0)
     elif preset == "no_low_speed":
         w["low_speed_penalty"] = 0.0     # VI-F: drop the near-inert, vision-noisy low-speed term
+    elif preset == "privileged":
+        kw["privileged_reward"] = True   # A5: camera-proxy obs (26-dim), exact simulator reward
     else:
         raise ValueError(f"unknown reward preset {preset!r}")
     kw["reward_weights"] = w
@@ -260,19 +284,175 @@ class RunningMeanStd:
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
-def _find_latest_checkpoint(ckpt_parent: Path) -> Optional[Path]:
-    """Return the last_model.pt with the highest global_step across all run dirs."""
+def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
+    """Atomically save a PyTorch checkpoint via sibling .tmp + os.replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_json_dump(data: Any, path: Path) -> None:
+    """Atomically write a JSON file via sibling .tmp + os.replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _normalize_sumo_cfg_path(raw_sumo_cfg: Any) -> Optional[str]:
+    """Normalize sumo_cfg path relative to repo root as POSIX for cross-host resume."""
+    if not raw_sumo_cfg:
+        return None
+    raw_str = str(raw_sumo_cfg)
+    posix_raw = raw_str.replace("\\", "/")
+    root_resolved = _ROOT.resolve()
+    try:
+        p = Path(raw_str)
+        resolved = p.resolve() if p.is_absolute() else (root_resolved / p).resolve()
+        rel = resolved.relative_to(root_resolved)
+        return rel.as_posix()
+    except Exception:
+        pass
+    # Cross-host absolute path from another checkout (e.g. /opt/.../sumo_configs/...
+    # or C:\...\sumo_configs\...): anchor on 'sumo_configs/' if present.
+    marker = "sumo_configs/"
+    idx = posix_raw.find(marker)
+    if idx >= 0:
+        return posix_raw[idx:]
+    # Strip leading "./" for clean POSIX consistency on synthetic/external paths.
+    while posix_raw.startswith("./"):
+        posix_raw = posix_raw[2:]
+    return posix_raw
+
+
+def _resume_signature(run_meta: Mapping[str, Any]) -> Dict[str, Any]:
+    """Extract the config fields that must match before auto-resuming a run."""
+    env_cfg = run_meta.get("env_cfg") or {}
+    sim_cfg = env_cfg.get("sim") or {}
+    obs_cfg = env_cfg.get("observation") or {}
+    train_cfg = run_meta.get("train_cfg") or {}
+
+    norm_sumo_cfg = _normalize_sumo_cfg_path(sim_cfg.get("sumo_cfg_path"))
+
+    raw_algo = run_meta.get("algo")
+    algo = str(raw_algo).lower() if raw_algo is not None else None
+
+    raw_seed = train_cfg.get("seed")
+    try:
+        seed: Optional[int] = int(raw_seed) if raw_seed is not None else None
+    except (TypeError, ValueError):
+        seed = None
+
+    raw_total = train_cfg.get("total_timesteps")
+    try:
+        total_timesteps: Optional[int] = int(raw_total) if raw_total is not None else None
+    except (TypeError, ValueError):
+        total_timesteps = None
+
+    raw_upstream = run_meta.get("upstream_phase_obs")
+    if raw_upstream is not None:
+        upstream_phase_obs = bool(raw_upstream)
+    else:
+        tls_feats = obs_cfg.get("tls_feature_names") or ()
+        upstream_phase_obs = any(str(n).startswith("upstream_phase_") for n in tls_feats)
+
+    shared_reward = bool(run_meta.get("shared_reward", False))
+
+    return {
+        "algo": algo,
+        "seed": seed,
+        "reward_preset": run_meta.get("reward_preset"),
+        "obs_mode": obs_cfg.get("obs_mode"),
+        "obs_ablation": run_meta.get("obs_ablation"),
+        "upstream_phase_obs": upstream_phase_obs,
+        "shared_reward": shared_reward,
+        "sumo_cfg": norm_sumo_cfg,
+        "total_timesteps": total_timesteps,
+        "schema_version": env_cfg.get("version"),
+    }
+
+
+def _find_latest_checkpoint(
+    ckpt_parent: Path,
+    current_run_meta: Mapping[str, Any],
+) -> Optional[Path]:
+    """Return the last_model.pt with the highest global_step whose sibling
+    run_config.json matches current_run_meta on all training-identity fields.
+    Candidates with missing, unreadable, or mismatched run_config.json are
+    skipped with an explicit reason printed to stdout.
+    """
+    if not ckpt_parent.exists():
+        return None
+    expected = _resume_signature(current_run_meta)
     best: Optional[Path] = None
     best_step = -1
-    for p in ckpt_parent.glob("*/last_model.pt"):
+    saw_candidates = False
+
+    for p in sorted(ckpt_parent.glob("*/last_model.pt")):
+        saw_candidates = True
+        cfg_path = p.parent / "run_config.json"
+        if not cfg_path.exists():
+            print(f"[resume] skipping {p}: missing sibling run_config.json")
+            continue
+        try:
+            cand_meta = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[resume] skipping {p}: unreadable run_config.json ({exc})")
+            continue
+        if not isinstance(cand_meta, dict):
+            print(f"[resume] skipping {p}: invalid run_config.json (expected JSON object)")
+            continue
+
+        cand_sig = _resume_signature(cand_meta)
+        mismatches = [
+            f"{k} (ckpt={cand_sig[k]!r} != current={expected[k]!r})"
+            for k in expected
+            if cand_sig[k] != expected[k]
+        ]
+        if mismatches:
+            print(f"[resume] skipping {p}: config mismatch — {'; '.join(mismatches)}")
+            continue
+
         try:
             ckpt = torch.load(p, map_location="cpu", weights_only=False)
             step = int(ckpt.get("global_step", 0))
             if step > best_step:
                 best, best_step = p, step
+        except Exception as exc:
+            print(f"[resume] skipping {p}: unreadable checkpoint ({exc})")
+            continue
+
+    if best is None and saw_candidates:
+        print("[resume] no matching checkpoint found; starting fresh")
+    return best
+
+
+def _find_stale_run_dir(
+    ckpt_parent: Path,
+    current_run_meta: Mapping[str, Any],
+) -> Optional[Path]:
+    """A matching run dir killed before its first last_model.pt (no bench.json).
+
+    Reusing it keeps the one-run-dir-per-job invariant across preemptions that
+    land before the first PPO update; otherwise each such restart leaves an
+    orphan dir (run_config.json, maybe an untrained best_model.pt) behind.
+    """
+    if not ckpt_parent.exists():
+        return None
+    expected = _resume_signature(current_run_meta)
+    for d in sorted((p for p in ckpt_parent.iterdir() if p.is_dir()), reverse=True):
+        if (d / "last_model.pt").exists() or (d / "bench.json").exists():
+            continue
+        try:
+            cand = json.loads((d / "run_config.json").read_text(encoding="utf-8"))
         except Exception:
             continue
-    return best
+        if isinstance(cand, dict) and _resume_signature(cand) == expected:
+            return d
+    return None
 
 
 def set_seed(seed: int) -> None:
@@ -510,13 +690,14 @@ def compute_gae(
 # Environment helpers
 # ---------------------------------------------------------------------
 def sync_obs_mode_from_checkpoint(args: argparse.Namespace) -> None:
-    """For eval modes: read obs_mode from the checkpoint's run_config.json.
+    """For eval modes: read obs_mode, obs_ablation, and upstream_phase_obs from run_config.json.
 
-    The privileged arm has a larger obs vector (38-dim vs 26-dim), so evaluating
-    a privileged checkpoint with the default proxy env would otherwise fail at
-    actor.load_state_dict. We resolve obs_mode from the run_config sitting next to
-    the checkpoint so the eval env is rebuilt with the matching dimensionality
-    without the caller having to remember --obs-mode.
+    The privileged arm (38-dim vs 26-dim), VI-F obs ablations (no_class_shares,
+    no_pressure_feature, lane_truncated), and n2_corridor coordination arm
+    (30-dim vs 26-dim) change the actor's input dimensionality or feature layout,
+    so evaluating a checkpoint with mismatched flags would otherwise fail or
+    corrupt inference. Resolve all of them from the run_config sitting next to
+    the checkpoint (matching eval_compare._obs_overrides_for_checkpoint).
     """
     ckpt = getattr(args, "checkpoint", None)
     if not ckpt:
@@ -526,12 +707,46 @@ def sync_obs_mode_from_checkpoint(args: argparse.Namespace) -> None:
         return
     try:
         run_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        mode = run_cfg.get("env_cfg", {}).get("observation", {}).get("obs_mode")
+        obs_cfg = run_cfg.get("env_cfg", {}).get("observation", {})
+        mode = obs_cfg.get("obs_mode")
     except Exception:
         return
     if mode in ("proxy", "privileged") and mode != getattr(args, "obs_mode", "proxy"):
         print(f"[eval] obs_mode resolved to {mode!r} from {cfg_path}")
         args.obs_mode = mode
+    if "upstream_phase_obs" in run_cfg:
+        want_upstream = bool(run_cfg["upstream_phase_obs"])
+        if want_upstream != bool(getattr(args, "upstream_phase_obs", False)):
+            print(f"[eval] upstream_phase_obs resolved to {want_upstream!r} from {cfg_path}")
+            args.upstream_phase_obs = want_upstream
+    elif isinstance(obs_cfg.get("tls_feature_names"), list):
+        want_upstream = any(
+            str(n).startswith("upstream_phase_") for n in obs_cfg["tls_feature_names"]
+        )
+        if want_upstream != bool(getattr(args, "upstream_phase_obs", False)):
+            print(f"[eval] upstream_phase_obs resolved to {want_upstream!r} from {cfg_path}")
+            args.upstream_phase_obs = want_upstream
+
+    obs_ablation = run_cfg.get("obs_ablation")
+    if obs_ablation not in OBS_ABLATIONS:
+        if obs_cfg.get("lane_truncated"):
+            obs_ablation = "lane_truncated"
+        else:
+            lane_feats = obs_cfg.get("lane_feature_names")
+            tls_feats = obs_cfg.get("tls_feature_names")
+            if (
+                isinstance(lane_feats, list)
+                and "motorbike_share" not in lane_feats
+                and "heavy_vehicle_share" not in lane_feats
+            ):
+                obs_ablation = "no_class_shares"
+            elif isinstance(tls_feats, list) and "pressure_norm" not in tls_feats:
+                obs_ablation = "no_pressure_feature"
+            else:
+                obs_ablation = None
+    if obs_ablation in OBS_ABLATIONS and obs_ablation != getattr(args, "obs_ablation", "none"):
+        print(f"[eval] obs_ablation resolved to {obs_ablation!r} from {cfg_path}")
+        args.obs_ablation = obs_ablation
 
 
 def make_env(args: argparse.Namespace) -> Tuple[MappoTrafficEnv, Any]:
@@ -613,23 +828,65 @@ def train(args: argparse.Namespace) -> None:
     set_seed(train_cfg.seed)
     device = torch.device(train_cfg.device)
 
-    # FIX: timestamped run dirs to prevent overwriting between runs
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = str(Path(train_cfg.log_dir) / run_id)
-    ckpt_dir = str(Path(train_cfg.ckpt_dir) / run_id)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
-
     env, env_cfg = make_env(args)
     tls_ids = list(env_cfg.tls_ids)
     obs_dim = env_cfg.local_obs_dim
     state_dim = env_cfg.global_state_dim
+    algo = str(getattr(args, "algo", "mappo")).lower()
+
+    # Resolve auto-resume BEFORE creating any timestamped run dir so Spot
+    # preemption restarts continue IN PLACE (single run_id, ckpt_dir, log_dir,
+    # best_model.pt, and bench.json per job).
+    probe_meta = {
+        "algo": algo,
+        "critic_arch": "independent_local" if algo == "ippo" else "central_multihead",
+        "reward_preset": getattr(args, "reward_preset", "full"),
+        "obs_ablation": getattr(args, "obs_ablation", "none"),
+        "upstream_phase_obs": bool(getattr(args, "upstream_phase_obs", False)),
+        "shared_reward": bool(getattr(args, "shared_reward", False)),
+        "lane_groups_file": getattr(args, "lane_groups", None),
+        "env_cfg": env_cfg.to_dict(),
+        "train_cfg": asdict(train_cfg),
+    }
+    _resume_ckpt = _find_latest_checkpoint(Path(train_cfg.ckpt_dir), probe_meta)
+    _resume_payload: Optional[Dict[str, Any]] = None
+    resume_episode_count = 0
+    if _resume_ckpt is not None:
+        run_id = _resume_ckpt.parent.name
+        ckpt_dir = str(_resume_ckpt.parent)
+        log_dir = str(Path(train_cfg.log_dir) / run_id)
+        print(f"[resume] found matching checkpoint at {_resume_ckpt} (reusing run_id={run_id} in place)")
+        _resume_payload = torch.load(_resume_ckpt, map_location=device, weights_only=False)
+        resume_episode_count = int(_resume_payload.get("episode_count", 0))
+    elif (_stale := _find_stale_run_dir(Path(train_cfg.ckpt_dir), probe_meta)) is not None:
+        # Killed before the first checkpoint: restart from scratch in the same dir,
+        # clearing its partial artefacts (e.g. an untrained best_model.pt, logs).
+        run_id = _stale.name
+        ckpt_dir = str(_stale)
+        log_dir = str(Path(train_cfg.log_dir) / run_id)
+        print(f"[resume] reusing pre-checkpoint run dir {_stale} (starting fresh in place)")
+        for _d in {Path(ckpt_dir), Path(log_dir)}:
+            if _d.exists():
+                shutil.rmtree(_d)
+    else:
+        base_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = base_run_id
+        _run_suffix = 1
+        while (
+            (Path(train_cfg.ckpt_dir) / run_id).exists()
+            or (Path(train_cfg.log_dir) / run_id).exists()
+        ):
+            run_id = f"{base_run_id}_{_run_suffix}"
+            _run_suffix += 1
+        log_dir = str(Path(train_cfg.log_dir) / run_id)
+        ckpt_dir = str(Path(train_cfg.ckpt_dir) / run_id)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     # action_dim: do a quick reset to let env build phase maps, then read it
-    obs_dict, info_dict = env.reset(seed=train_cfg.seed)
+    obs_dict, info_dict = env.reset(seed=train_cfg.seed + resume_episode_count)
     action_dim: int = getattr(env, "action_dim", 2)
 
-    algo = str(getattr(args, "algo", "mappo")).lower()
     actor = Actor(obs_dim, action_dim).to(device)
     if algo == "ippo":
         # IPPO: decentralized critics — each value head sees ONLY its agent's
@@ -657,36 +914,25 @@ def train(args: argparse.Namespace) -> None:
 
     run_meta = {
         "run_id": run_id,
-        "algo": algo,
-        "critic_arch": "independent_local" if algo == "ippo" else "central_multihead",
-        "reward_preset": getattr(args, "reward_preset", "full"),
-        "obs_ablation": getattr(args, "obs_ablation", "none"),
-        "lane_groups_file": getattr(args, "lane_groups", None),
-        "env_cfg": env_cfg.to_dict(),
-        "train_cfg": asdict(train_cfg),
+        **probe_meta,
         "tls_ids": tls_ids,
         "obs_dim": obs_dim,
         "state_dim": state_dim,
         "action_dim": action_dim,
     }
-    # FIX: save run_config.json to both log_dir and ckpt_dir
     for save_dir in (log_dir, ckpt_dir):
-        with open(Path(save_dir) / "run_config.json", "w", encoding="utf-8") as f:
-            json.dump(run_meta, f, ensure_ascii=False, indent=2)
+        _atomic_json_dump(run_meta, Path(save_dir) / "run_config.json")
 
     buffer = RolloutBuffer(tls_ids)
     global_step = 0
+    episode_count = 0
     update_idx = 0
     best_mean_reward = -float("inf")
+    prior_elapsed_s = 0.0
     start_time = time.time()
 
-    # Auto-resume: on crash-restart, pick up from the most advanced last_model.pt
-    # across all previous run dirs. SUMO starts a fresh episode (state not saved)
-    # but the policy/optimizer/normalizer states are restored — net progress is kept.
-    _resume_ckpt = _find_latest_checkpoint(Path(train_cfg.ckpt_dir))
-    if _resume_ckpt is not None:
-        print(f"[resume] found checkpoint at {_resume_ckpt}")
-        _c = torch.load(_resume_ckpt, map_location=device, weights_only=False)
+    if _resume_payload is not None:
+        _c = _resume_payload
         actor.load_state_dict(_c["actor_state_dict"])
         critic.load_state_dict(_c["critic_state_dict"])
         actor_optim.load_state_dict(_c["actor_optim_state_dict"])
@@ -699,12 +945,83 @@ def train(args: argparse.Namespace) -> None:
             state_rms.load_state_dict(_c["state_rms"])
         global_step = int(_c.get("global_step", 0))
         episode_count = int(_c.get("episode_count", 0))
-        update_idx = global_step // train_cfg.rollout_horizon
-        print(f"[resume] restored global_step={global_step}, update_idx={update_idx}")
+        update_idx = int(_c.get("update_idx", global_step // max(train_cfg.rollout_horizon, 1)))
+        if "best_mean_reward" in _c and _c["best_mean_reward"] is not None:
+            best_mean_reward = float(_c["best_mean_reward"])
+        prior_elapsed_s = float(_c.get("elapsed_seconds_prior", 0.0))
+        try:
+            if _c.get("python_rng_state") is not None:
+                random.setstate(_c["python_rng_state"])
+            if _c.get("numpy_rng_state") is not None:
+                np.random.set_state(_c["numpy_rng_state"])
+            if _c.get("torch_rng_state") is not None:
+                rng_t = _c["torch_rng_state"]
+                torch.set_rng_state(rng_t.cpu() if isinstance(rng_t, torch.Tensor) else rng_t)
+            if torch.cuda.is_available() and _c.get("torch_cuda_rng_state") is not None:
+                torch.cuda.set_rng_state_all(_c["torch_cuda_rng_state"])
+        except Exception as exc:
+            print(f"[resume] warning: could not restore RNG state ({exc})")
+        print(
+            f"[resume] restored run_id={run_id} global_step={global_step}, "
+            f"episode_count={episode_count}, update_idx={update_idx}, "
+            f"best_mean_reward={best_mean_reward}"
+        )
+
+    def _build_checkpoint_payload() -> Dict[str, Any]:
+        cur_entropy_coef = get_entropy_coef(
+            global_step, train_cfg.total_timesteps,
+            train_cfg.entropy_coef_start, train_cfg.entropy_coef_end,
+        )
+        return {
+            "run_id": run_id,
+            "algo": algo,
+            "actor_state_dict": actor.state_dict(),
+            "critic_state_dict": critic.state_dict(),
+            "actor_optim_state_dict": actor_optim.state_dict(),
+            "critic_optim_state_dict": critic_optim.state_dict(),
+            "actor_scheduler_state_dict": actor_scheduler.state_dict(),
+            "critic_scheduler_state_dict": critic_scheduler.state_dict(),
+            "global_step": global_step,
+            "episode_count": episode_count,
+            "update_idx": update_idx,
+            "best_mean_reward": best_mean_reward,
+            "entropy_coef": cur_entropy_coef,
+            "entropy_coef_start": train_cfg.entropy_coef_start,
+            "entropy_coef_end": train_cfg.entropy_coef_end,
+            "elapsed_seconds_prior": prior_elapsed_s + (time.time() - start_time),
+            "env_cfg": env_cfg.to_dict(),
+            "train_cfg": asdict(train_cfg),
+            "obs_dim": obs_dim,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "obs_rms": obs_rms.state_dict(),
+            "state_rms": state_rms.state_dict(),
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "torch_cuda_rng_state": (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            ),
+        }
+
+    _term_requested = False
+    _term_sig_name = ""
+    _prev_sigterm = None
+    if hasattr(signal, "SIGTERM"):
+        def _on_sigterm(signum: int, _frame: Any) -> None:
+            nonlocal _term_requested, _term_sig_name
+            _term_requested = True
+            _term_sig_name = (
+                signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+            )
+
+        try:
+            _prev_sigterm = signal.signal(signal.SIGTERM, _on_sigterm)
+        except ValueError:
+            _prev_sigterm = None
 
     global_state = extract_global_state(info_dict, fallback=flatten_obs_dict(obs_dict, tls_ids))
 
-    episode_count = 0
     episode_length = 0
     episode_agent_rewards: Dict[str, float] = {tls_id: 0.0 for tls_id in tls_ids}
     episode_queue_total = 0.0
@@ -726,469 +1043,455 @@ def train(args: argparse.Namespace) -> None:
         episode_waiting = 0.0
         ep_prev_passed = 0.0
 
-    while global_step < train_cfg.total_timesteps:
-        buffer.clear()
+    try:
+        while global_step < train_cfg.total_timesteps and not _term_requested:
+            buffer.clear()
 
-        actor.eval()
-        critic.eval()
+            actor.eval()
+            critic.eval()
 
-        for _ in range(train_cfg.rollout_horizon):
-            action_dict: Dict[str, int] = {}
-            logprob_dict: Dict[str, float] = {}
-            norm_obs_rows: List[np.ndarray] = []
+            for _ in range(train_cfg.rollout_horizon):
+                if _term_requested:
+                    break
+                action_dict: Dict[str, int] = {}
+                logprob_dict: Dict[str, float] = {}
+                norm_obs_rows: List[np.ndarray] = []
 
-            for tls_id in tls_ids:
-                obs = np.asarray(obs_dict[tls_id], dtype=np.float32).reshape(-1)
-                norm_obs = obs_rms.normalize(obs)
-                norm_obs_rows.append(norm_obs)
-                obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                for tls_id in tls_ids:
+                    obs = np.asarray(obs_dict[tls_id], dtype=np.float32).reshape(-1)
+                    norm_obs = obs_rms.normalize(obs)
+                    norm_obs_rows.append(norm_obs)
+                    obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        dist = actor.distribution(obs_tensor)
+                        action = dist.sample()
+                        logprob = dist.log_prob(action)
+
+                    action_dict[tls_id] = int(action.item())
+                    logprob_dict[tls_id] = float(logprob.item())
+
                 with torch.no_grad():
-                    dist = actor.distribution(obs_tensor)
-                    action = dist.sample()
-                    logprob = dist.log_prob(action)
+                    if algo == "ippo":
+                        obs_all_t = torch.as_tensor(
+                            np.stack(norm_obs_rows, axis=0), dtype=torch.float32, device=device
+                        ).unsqueeze(0)  # (1, N, obs_dim)
+                        value = critic(obs_all_t).squeeze(0).cpu().numpy().astype(np.float32)
+                    else:
+                        norm_state = state_rms.normalize(global_state)
+                        state_tensor = torch.as_tensor(
+                            norm_state, dtype=torch.float32, device=device
+                        ).unsqueeze(0)
+                        value = critic(state_tensor).squeeze(0).cpu().numpy().astype(np.float32)
 
-                action_dict[tls_id] = int(action.item())
-                logprob_dict[tls_id] = float(logprob.item())
+                next_obs_dict, reward_dict, terminated_dict, truncated_dict, next_info_dict = env.step(action_dict)
+                next_global_state = extract_global_state(next_info_dict, fallback=global_state)
 
-            with torch.no_grad():
-                if algo == "ippo":
-                    obs_all_t = torch.as_tensor(
-                        np.stack(norm_obs_rows, axis=0), dtype=torch.float32, device=device
-                    ).unsqueeze(0)  # (1, N, obs_dim)
-                    value = critic(obs_all_t).squeeze(0).cpu().numpy().astype(np.float32)
-                else:
-                    norm_state = state_rms.normalize(global_state)
-                    state_tensor = torch.as_tensor(
-                        norm_state, dtype=torch.float32, device=device
-                    ).unsqueeze(0)
-                    value = critic(state_tensor).squeeze(0).cpu().numpy().astype(np.float32)
+                team_reward = float(np.mean(list(reward_dict.values()))) if reward_dict else 0.0
 
-            next_obs_dict, reward_dict, terminated_dict, truncated_dict, next_info_dict = env.step(action_dict)
-            next_global_state = extract_global_state(next_info_dict, fallback=global_state)
-
-            team_reward = float(np.mean(list(reward_dict.values()))) if reward_dict else 0.0
-
-            rec = StepRecord(
-                obs_dict={k: np.asarray(v, dtype=np.float32).copy() for k, v in obs_dict.items()},
-                global_state=np.asarray(global_state, dtype=np.float32).copy(),
-                action_dict=dict(action_dict),
-                logprob_dict=dict(logprob_dict),
-                reward_dict={k: float(v) for k, v in reward_dict.items()},
-                terminated_dict={k: bool(v) for k, v in terminated_dict.items()},
-                truncated_dict={k: bool(v) for k, v in truncated_dict.items()},
-                value=value,
-                team_reward=team_reward,
-            )
-            buffer.add(rec)
-
-            episode_length += 1
-            global_step += 1
-
-            for tls_id in tls_ids:
-                episode_agent_rewards[tls_id] += float(reward_dict.get(tls_id, 0.0))
-                episode_queue_total += float(next_info_dict.get(tls_id, {}).get("queue_total_proxy", 0.0))
-
-            step_co2, step_fuel = extract_step_emissions(next_info_dict)
-            episode_co2 += step_co2
-            episode_fuel += step_fuel
-            episode_waiting += extract_step_waiting(next_info_dict)
-
-            # FIX: current_passed now set by env; reliable throughput tracking
-            first_info = next(iter(next_info_dict.values()), {})
-            current_passed = float(first_info.get("current_passed", ep_prev_passed))
-            episode_throughput += max(current_passed - ep_prev_passed, 0.0)
-            ep_prev_passed = current_passed
-
-            obs_dict = next_obs_dict
-            global_state = next_global_state
-
-            done_now = any(terminated_dict.values()) or any(truncated_dict.values())
-            if done_now:
-                episode_count += 1
-                mean_episode_reward = float(np.mean(list(episode_agent_rewards.values())))
-
-                writer.add_scalar("episode/mean_reward", mean_episode_reward, global_step)
-                writer.add_scalar("episode/length", episode_length, global_step)
-                writer.add_scalar("episode/queue_total_proxy", episode_queue_total, global_step)
-                writer.add_scalar("episode/co2_total_mg", episode_co2, global_step)
-                writer.add_scalar("episode/fuel_total_ml", episode_fuel, global_step)
-                writer.add_scalar("episode/throughput", episode_throughput, global_step)
-                writer.add_scalar("episode/avg_waiting_proxy", episode_waiting, global_step)
-
-                csv_logger.log_episode(
-                    global_step=global_step,
-                    episode=episode_count,
-                    episode_length=episode_length,
-                    mean_reward=mean_episode_reward,
-                    queue_total_proxy=episode_queue_total,
-                    co2_total_mg=episode_co2,
-                    fuel_total_ml=episode_fuel,
-                    throughput=episode_throughput,
-                    avg_waiting_proxy=episode_waiting,
+                rec = StepRecord(
+                    obs_dict={k: np.asarray(v, dtype=np.float32).copy() for k, v in obs_dict.items()},
+                    global_state=np.asarray(global_state, dtype=np.float32).copy(),
+                    action_dict=dict(action_dict),
+                    logprob_dict=dict(logprob_dict),
+                    reward_dict={k: float(v) for k, v in reward_dict.items()},
+                    terminated_dict={k: bool(v) for k, v in terminated_dict.items()},
+                    truncated_dict={k: bool(v) for k, v in truncated_dict.items()},
+                    value=value,
+                    team_reward=team_reward,
                 )
+                buffer.add(rec)
 
-                if mean_episode_reward > best_mean_reward:
-                    best_mean_reward = mean_episode_reward
-                    # FIX: save as best_model.pt per spec
-                    torch.save(
-                        {
-                            "actor_state_dict": actor.state_dict(),
-                            "critic_state_dict": critic.state_dict(),
-                            "actor_optim_state_dict": actor_optim.state_dict(),
-                            "critic_optim_state_dict": critic_optim.state_dict(),
-                            "global_step": global_step,
-                            "episode_count": episode_count,
-                            "best_mean_reward": best_mean_reward,
-                            "env_cfg": env_cfg.to_dict(),
-                            "train_cfg": asdict(train_cfg),
-                            "obs_rms": obs_rms.state_dict(),
-                            "state_rms": state_rms.state_dict(),
-                        },
-                        Path(ckpt_dir) / "best_model.pt",
+                episode_length += 1
+                global_step += 1
+
+                for tls_id in tls_ids:
+                    episode_agent_rewards[tls_id] += float(reward_dict.get(tls_id, 0.0))
+                    episode_queue_total += float(next_info_dict.get(tls_id, {}).get("queue_total_proxy", 0.0))
+
+                step_co2, step_fuel = extract_step_emissions(next_info_dict)
+                episode_co2 += step_co2
+                episode_fuel += step_fuel
+                episode_waiting += extract_step_waiting(next_info_dict)
+
+                # FIX: current_passed now set by env; reliable throughput tracking
+                first_info = next(iter(next_info_dict.values()), {})
+                current_passed = float(first_info.get("current_passed", ep_prev_passed))
+                episode_throughput += max(current_passed - ep_prev_passed, 0.0)
+                ep_prev_passed = current_passed
+
+                obs_dict = next_obs_dict
+                global_state = next_global_state
+
+                done_now = any(terminated_dict.values()) or any(truncated_dict.values())
+                if done_now:
+                    episode_count += 1
+                    mean_episode_reward = float(np.mean(list(episode_agent_rewards.values())))
+
+                    writer.add_scalar("episode/mean_reward", mean_episode_reward, global_step)
+                    writer.add_scalar("episode/length", episode_length, global_step)
+                    writer.add_scalar("episode/queue_total_proxy", episode_queue_total, global_step)
+                    writer.add_scalar("episode/co2_total_mg", episode_co2, global_step)
+                    writer.add_scalar("episode/fuel_total_ml", episode_fuel, global_step)
+                    writer.add_scalar("episode/throughput", episode_throughput, global_step)
+                    writer.add_scalar("episode/avg_waiting_proxy", episode_waiting, global_step)
+
+                    csv_logger.log_episode(
+                        global_step=global_step,
+                        episode=episode_count,
+                        episode_length=episode_length,
+                        mean_reward=mean_episode_reward,
+                        queue_total_proxy=episode_queue_total,
+                        co2_total_mg=episode_co2,
+                        fuel_total_ml=episode_fuel,
+                        throughput=episode_throughput,
+                        avg_waiting_proxy=episode_waiting,
                     )
 
-                obs_dict, info_dict = env.reset(seed=train_cfg.seed + episode_count)
-                global_state = extract_global_state(info_dict, fallback=flatten_obs_dict(obs_dict, tls_ids))
-                reset_episode_stats()
+                    if mean_episode_reward > best_mean_reward:
+                        best_mean_reward = mean_episode_reward
+                        _atomic_torch_save(_build_checkpoint_payload(), Path(ckpt_dir) / "best_model.pt")
 
-            if global_step >= train_cfg.total_timesteps:
+                    if not _term_requested and global_step < train_cfg.total_timesteps:
+                        obs_dict, info_dict = env.reset(seed=train_cfg.seed + episode_count)
+                        global_state = extract_global_state(info_dict, fallback=flatten_obs_dict(obs_dict, tls_ids))
+                    reset_episode_stats()
+
+                if global_step >= train_cfg.total_timesteps or _term_requested:
+                    break
+
+            if _term_requested:
                 break
 
-        if len(buffer) == 0:
-            continue
+            if len(buffer) == 0:
+                continue
 
-        # --------------------------------------------------
-        # Update RunningMeanStd with rollout batch
-        # --------------------------------------------------
-        all_obs = np.stack([
-            np.asarray(rec.obs_dict[tls_id], dtype=np.float32).reshape(-1)
-            for rec in buffer.records
-            for tls_id in tls_ids
-        ], axis=0)
-        obs_rms.update(all_obs)
+            # --------------------------------------------------
+            # Update RunningMeanStd with rollout batch
+            # --------------------------------------------------
+            all_obs = np.stack([
+                np.asarray(rec.obs_dict[tls_id], dtype=np.float32).reshape(-1)
+                for rec in buffer.records
+                for tls_id in tls_ids
+            ], axis=0)
+            obs_rms.update(all_obs)
 
-        all_states = np.stack([
-            np.asarray(rec.global_state, dtype=np.float32).reshape(-1)
-            for rec in buffer.records
-        ], axis=0)
-        state_rms.update(all_states)
+            all_states = np.stack([
+                np.asarray(rec.global_state, dtype=np.float32).reshape(-1)
+                for rec in buffer.records
+            ], axis=0)
+            state_rms.update(all_states)
 
-        # --------------------------------------------------
-        # Bootstrap value for last state.
-        # --------------------------------------------------
-        actor.eval()
-        critic.eval()
-        with torch.no_grad():
+            # --------------------------------------------------
+            # Bootstrap value for last state.
+            # --------------------------------------------------
+            actor.eval()
+            critic.eval()
+            with torch.no_grad():
+                if algo == "ippo":
+                    last_obs_rows = np.stack(
+                        [
+                            obs_rms.normalize(np.asarray(obs_dict[t], dtype=np.float32).reshape(-1))
+                            for t in tls_ids
+                        ],
+                        axis=0,
+                    )
+                    last_in = torch.as_tensor(last_obs_rows, dtype=torch.float32, device=device).unsqueeze(0)
+                else:
+                    norm_last = state_rms.normalize(global_state)
+                    last_in = torch.as_tensor(norm_last, dtype=torch.float32, device=device).unsqueeze(0)
+                last_values = critic(last_in).squeeze(0).cpu().numpy().astype(np.float32)
+
+            last_record = buffer.records[-1]
+            if any(last_record.terminated_dict.values()) or any(last_record.truncated_dict.values()):
+                last_values = np.zeros_like(last_values)
+
+            # --------------------------------------------------
+            # GAE — v3: per-agent advantages from per-agent shaped rewards
+            # and per-agent value heads (episode boundaries are shared).
+            # --------------------------------------------------
+            dones = np.asarray([
+                float(any(rec.terminated_dict.values()) or any(rec.truncated_dict.values()))
+                for rec in buffer.records
+            ], dtype=np.float32)
+
+            rewards_mat = np.asarray(
+                [[rec.reward_dict.get(tls_id, 0.0) for tls_id in tls_ids] for rec in buffer.records],
+                dtype=np.float32,
+            )  # (T, N)
+            values_mat = np.stack(
+                [np.asarray(rec.value, dtype=np.float32).reshape(-1) for rec in buffer.records],
+                axis=0,
+            )  # (T, N)
+
+            # shared-reward: replace per-agent rewards with team mean so all agents
+            # receive the same signal — incentivises coordination (e.g. green-wave
+            # on corridor networks) at the cost of per-agent credit assignment.
+            if getattr(args, "shared_reward", False):
+                team_rewards = rewards_mat.mean(axis=1, keepdims=True)          # (T,1)
+                rewards_mat = np.repeat(team_rewards, len(tls_ids), axis=1)     # (T,N)
+
+            adv_cols: List[np.ndarray] = []
+            ret_cols: List[np.ndarray] = []
+            for agent_idx in range(len(tls_ids)):
+                adv_i, ret_i = compute_gae(
+                    rewards=rewards_mat[:, agent_idx],
+                    values=values_mat[:, agent_idx],
+                    dones=dones,
+                    last_value=float(last_values[agent_idx]),
+                    gamma=train_cfg.gamma,
+                    gae_lambda=train_cfg.gae_lambda,
+                )
+                adv_cols.append(adv_i)
+                ret_cols.append(ret_i)
+
+            adv_mat = np.stack(adv_cols, axis=1)        # (T, N)
+            returns_mat = np.stack(ret_cols, axis=1)    # (T, N)
+
+            # joint normalization keeps a single advantage scale for the shared actor
+            adv_flat = adv_mat.reshape(-1)
+            adv_mat_norm = (adv_mat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+
+            advantages_by_tls: Dict[str, np.ndarray] = {
+                tls_id: np.ascontiguousarray(adv_mat_norm[:, agent_idx])
+                for agent_idx, tls_id in enumerate(tls_ids)
+            }
+
+            actor_flat = buffer.actor_flatten(advantages_by_tls)
+            critic_flat = buffer.critic_flatten(returns_mat=returns_mat)
+
+            actor_flat["obs"] = obs_rms.normalize(actor_flat["obs"])
+            critic_flat["states"] = state_rms.normalize(critic_flat["states"])
+
+            obs_t = torch.as_tensor(actor_flat["obs"], dtype=torch.float32, device=device)
+            action_t = torch.as_tensor(actor_flat["actions"], dtype=torch.int64, device=device)
+            old_logprob_t = torch.as_tensor(actor_flat["logprobs"], dtype=torch.float32, device=device)
+            adv_t = torch.as_tensor(actor_flat["advantages"], dtype=torch.float32, device=device)
+
+            # critic input: MAPPO -> normalized global state (T, S);
+            # IPPO -> per-agent normalized local obs (T, N, obs_dim). actor_flat
+            # obs is agent-major [(agent0 t0..T-1), (agent1 ...)], already
+            # normalized above — reshape instead of re-normalizing.
             if algo == "ippo":
-                last_obs_rows = np.stack(
-                    [
-                        obs_rms.normalize(np.asarray(obs_dict[t], dtype=np.float32).reshape(-1))
-                        for t in tls_ids
-                    ],
-                    axis=0,
-                )
-                last_in = torch.as_tensor(last_obs_rows, dtype=torch.float32, device=device).unsqueeze(0)
+                T_steps = len(buffer)
+                critic_in = (
+                    actor_flat["obs"]
+                    .reshape(len(tls_ids), T_steps, obs_dim)
+                    .transpose(1, 0, 2)
+                )  # (T, N, obs_dim)
             else:
-                norm_last = state_rms.normalize(global_state)
-                last_in = torch.as_tensor(norm_last, dtype=torch.float32, device=device).unsqueeze(0)
-            last_values = critic(last_in).squeeze(0).cpu().numpy().astype(np.float32)
+                critic_in = critic_flat["states"]
 
-        last_record = buffer.records[-1]
-        if any(last_record.terminated_dict.values()) or any(last_record.truncated_dict.values()):
-            last_values = np.zeros_like(last_values)
+            state_t = torch.as_tensor(critic_in, dtype=torch.float32, device=device)
+            old_value_t = torch.as_tensor(critic_flat["values"], dtype=torch.float32, device=device)   # (T, N)
+            ret_t = torch.as_tensor(critic_flat["returns"], dtype=torch.float32, device=device)        # (T, N)
 
-        # --------------------------------------------------
-        # GAE — v3: per-agent advantages from per-agent shaped rewards
-        # and per-agent value heads (episode boundaries are shared).
-        # --------------------------------------------------
-        dones = np.asarray([
-            float(any(rec.terminated_dict.values()) or any(rec.truncated_dict.values()))
-            for rec in buffer.records
-        ], dtype=np.float32)
+            # --------------------------------------------------
+            # PPO update
+            # --------------------------------------------------
+            actor.train()
+            critic.train()
 
-        rewards_mat = np.asarray(
-            [[rec.reward_dict.get(tls_id, 0.0) for tls_id in tls_ids] for rec in buffer.records],
-            dtype=np.float32,
-        )  # (T, N)
-        values_mat = np.stack(
-            [np.asarray(rec.value, dtype=np.float32).reshape(-1) for rec in buffer.records],
-            axis=0,
-        )  # (T, N)
-
-        # shared-reward: replace per-agent rewards with team mean so all agents
-        # receive the same signal — incentivises coordination (e.g. green-wave
-        # on corridor networks) at the cost of per-agent credit assignment.
-        if getattr(args, "shared_reward", False):
-            team_rewards = rewards_mat.mean(axis=1, keepdims=True)          # (T,1)
-            rewards_mat = np.repeat(team_rewards, len(tls_ids), axis=1)     # (T,N)
-
-        adv_cols: List[np.ndarray] = []
-        ret_cols: List[np.ndarray] = []
-        for agent_idx in range(len(tls_ids)):
-            adv_i, ret_i = compute_gae(
-                rewards=rewards_mat[:, agent_idx],
-                values=values_mat[:, agent_idx],
-                dones=dones,
-                last_value=float(last_values[agent_idx]),
-                gamma=train_cfg.gamma,
-                gae_lambda=train_cfg.gae_lambda,
+            entropy_coef = get_entropy_coef(
+                global_step, train_cfg.total_timesteps,
+                train_cfg.entropy_coef_start, train_cfg.entropy_coef_end,
             )
-            adv_cols.append(adv_i)
-            ret_cols.append(ret_i)
 
-        adv_mat = np.stack(adv_cols, axis=1)        # (T, N)
-        returns_mat = np.stack(ret_cols, axis=1)    # (T, N)
+            policy_losses, value_losses, entropies, kls, clip_fracs = [], [], [], [], []
 
-        # joint normalization keeps a single advantage scale for the shared actor
-        adv_flat = adv_mat.reshape(-1)
-        adv_mat_norm = (adv_mat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+            batch_size_actor = obs_t.shape[0]
+            batch_size_critic = state_t.shape[0]
 
-        advantages_by_tls: Dict[str, np.ndarray] = {
-            tls_id: np.ascontiguousarray(adv_mat_norm[:, agent_idx])
-            for agent_idx, tls_id in enumerate(tls_ids)
+            actor_indices = np.arange(batch_size_actor)
+            skip_actor = False
+
+            for _ in range(train_cfg.update_epochs):
+
+                if not skip_actor:
+                    actor_indices = np.random.permutation(batch_size_actor)
+
+                    for start in range(0, batch_size_actor, train_cfg.minibatch_size):
+                        mb_idx = actor_indices[start:start + train_cfg.minibatch_size]
+
+                        dist = actor.distribution(obs_t[mb_idx])
+                        new_logprob = dist.log_prob(action_t[mb_idx])
+                        entropy = dist.entropy().mean()
+
+                        logratio = new_logprob - old_logprob_t[mb_idx]
+                        ratio = torch.exp(logratio)
+
+                        with torch.no_grad():
+                            approx_kl = ((ratio - 1.0) - logratio).mean().item()
+                            clip_frac = ((ratio - 1.0).abs() > train_cfg.clip_ratio).float().mean().item()
+
+                        surr1 = ratio * adv_t[mb_idx]
+                        surr2 = torch.clamp(ratio, 1.0 - train_cfg.clip_ratio, 1.0 + train_cfg.clip_ratio) * adv_t[mb_idx]
+                        policy_loss = -torch.min(surr1, surr2).mean()
+
+                        loss_actor = policy_loss - entropy_coef * entropy
+
+                        actor_optim.zero_grad(set_to_none=True)
+                        loss_actor.backward()
+                        nn.utils.clip_grad_norm_(actor.parameters(), train_cfg.max_grad_norm)
+                        actor_optim.step()
+
+                        policy_losses.append(policy_loss.item())
+                        entropies.append(entropy.item())
+                        kls.append(approx_kl)
+                        clip_fracs.append(clip_frac)
+
+                    if np.mean(kls) > 1.5 * train_cfg.target_kl:
+                        skip_actor = True
+                        writer.add_scalar("debug/early_stop_kl", 1.0, global_step)
+
+                critic_indices = np.random.permutation(batch_size_critic)
+                critic_mb_size = max(train_cfg.minibatch_size, 1)
+
+                for start in range(0, batch_size_critic, critic_mb_size):
+                    mb_idx = critic_indices[start:start + critic_mb_size]
+
+                    value_pred = critic(state_t[mb_idx])
+
+                    # FIX: use clip_range_vf (not clip_ratio) for value loss clipping
+                    value_pred_clipped = old_value_t[mb_idx] + torch.clamp(
+                        value_pred - old_value_t[mb_idx],
+                        -train_cfg.clip_range_vf,
+                        train_cfg.clip_range_vf,
+                    )
+
+                    value_loss_unclipped = (ret_t[mb_idx] - value_pred).pow(2)
+                    value_loss_clipped = (ret_t[mb_idx] - value_pred_clipped).pow(2)
+
+                    value_loss = train_cfg.value_coef * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+
+                    critic_optim.zero_grad(set_to_none=True)
+                    value_loss.backward()
+                    nn.utils.clip_grad_norm_(critic.parameters(), train_cfg.max_grad_norm)
+                    critic_optim.step()
+
+                    value_losses.append(value_loss.item())
+
+            actor_scheduler.step()
+            critic_scheduler.step()
+            current_lr = actor_scheduler.get_last_lr()[0]
+
+            # --------------------------------------------------
+            # Logging
+            # --------------------------------------------------
+            total_elapsed = prior_elapsed_s + (time.time() - start_time)
+            sps = int(global_step / max(total_elapsed, 1e-8))
+            ev = explained_variance(
+                critic_flat["values"].reshape(-1), returns_mat.reshape(-1)
+            )
+
+            writer.add_scalar("charts/SPS", sps, global_step)
+            writer.add_scalar("loss/policy", float(np.mean(policy_losses)), global_step)
+            writer.add_scalar("loss/value", float(np.mean(value_losses)), global_step)
+            writer.add_scalar("loss/entropy", float(np.mean(entropies)), global_step)
+            writer.add_scalar("loss/approx_kl", float(np.mean(kls)), global_step)
+            writer.add_scalar("loss/clip_fraction", float(np.mean(clip_fracs)), global_step)
+            writer.add_scalar("loss/explained_variance", ev, global_step)
+            writer.add_scalar("train/lr", current_lr, global_step)
+            writer.add_scalar("train/entropy_coef", entropy_coef, global_step)
+            writer.add_scalar("train/actor_batch_size", batch_size_actor, global_step)
+            writer.add_scalar("train/episode_count", episode_count, global_step)
+            writer.add_scalar("train/return_mean", float(np.mean(returns_mat)), global_step)
+            writer.add_scalar("train/adv_mean", float(np.mean(adv_mat)), global_step)
+            for agent_idx, tls_id in enumerate(tls_ids):
+                writer.add_scalar(f"train/return_mean_{tls_id}", float(np.mean(returns_mat[:, agent_idx])), global_step)
+
+            csv_logger.log_update(
+                global_step=global_step,
+                episode=episode_count,
+                update_idx=update_idx,
+                policy_loss=float(np.mean(policy_losses)),
+                value_loss=float(np.mean(value_losses)),
+                entropy=float(np.mean(entropies)),
+                approx_kl=float(np.mean(kls)),
+                clip_fraction=float(np.mean(clip_fracs)),
+                explained_variance=ev,
+                sps=sps,
+                lr=current_lr,
+                entropy_coef=entropy_coef,
+            )
+
+            should_save_latest = (update_idx % train_cfg.save_latest_every_updates == 0)
+            update_idx += 1
+
+            # Periodic checkpoint (atomic)
+            if global_step % train_cfg.save_every_steps < train_cfg.rollout_horizon:
+                ckpt_path = Path(ckpt_dir) / f"checkpoint_{global_step}.pt"
+                _atomic_torch_save(_build_checkpoint_payload(), ckpt_path)
+
+            # Latest checkpoint for Spot preemption resume (atomic)
+            if should_save_latest:
+                _atomic_torch_save(_build_checkpoint_payload(), Path(ckpt_dir) / "last_model.pt")
+
+            print(
+                f"step={global_step:>8} | ep={episode_count:>4} | "
+                f"pi={np.mean(policy_losses):>8.4f} | vf={np.mean(value_losses):>8.4f} | "
+                f"ent={np.mean(entropies):>7.4f} | kl={np.mean(kls):>7.5f} | "
+                f"clip={np.mean(clip_fracs):>6.3f} | lr={current_lr:.2e} | sps={sps:>5}"
+            )
+
+        if _term_requested:
+            _atomic_torch_save(_build_checkpoint_payload(), Path(ckpt_dir) / "last_model.pt")
+            print(
+                f"[signal] received {_term_sig_name}; saved last_model.pt at "
+                f"global_step={global_step} in {ckpt_dir}; exiting cleanly."
+            )
+            return
+
+        # Guarantee final last_model.pt and at least one best_model.pt on completion
+        final_payload = _build_checkpoint_payload()
+        _atomic_torch_save(final_payload, Path(ckpt_dir) / "last_model.pt")
+        best_path = Path(ckpt_dir) / "best_model.pt"
+        if not best_path.exists():
+            _atomic_torch_save(final_payload, best_path)
+
+        # ----- wall-clock benchmark summary (pilot instrumentation) -----
+        elapsed_s = prior_elapsed_s + (time.time() - start_time)
+        mean_sps = global_step / max(elapsed_s, 1e-9)
+        proj_2m_h = 2_000_000 / max(mean_sps, 1e-9) / 3600.0
+        bench = {
+            "run_id": run_id,
+            "algo": algo,
+            "num_agents": len(tls_ids),
+            "global_steps": global_step,
+            "episodes": episode_count,
+            "elapsed_seconds": round(elapsed_s, 1),
+            "mean_steps_per_second": round(mean_sps, 2),
+            "projected_hours_2M_steps": round(proj_2m_h, 2),
+            "projected_hours_2M_x5_seeds": round(proj_2m_h * 5, 2),
+            "device": train_cfg.device,
+            "ckpt_dir": ckpt_dir,
+            "log_dir": log_dir,
         }
+        for save_dir in (log_dir, ckpt_dir):
+            _atomic_json_dump(bench, Path(save_dir) / "bench.json")
 
-        actor_flat = buffer.actor_flatten(advantages_by_tls)
-        critic_flat = buffer.critic_flatten(returns_mat=returns_mat)
-
-        actor_flat["obs"] = obs_rms.normalize(actor_flat["obs"])
-        critic_flat["states"] = state_rms.normalize(critic_flat["states"])
-
-        obs_t = torch.as_tensor(actor_flat["obs"], dtype=torch.float32, device=device)
-        action_t = torch.as_tensor(actor_flat["actions"], dtype=torch.int64, device=device)
-        old_logprob_t = torch.as_tensor(actor_flat["logprobs"], dtype=torch.float32, device=device)
-        adv_t = torch.as_tensor(actor_flat["advantages"], dtype=torch.float32, device=device)
-
-        # critic input: MAPPO -> normalized global state (T, S);
-        # IPPO -> per-agent normalized local obs (T, N, obs_dim). actor_flat
-        # obs is agent-major [(agent0 t0..T-1), (agent1 ...)], already
-        # normalized above — reshape instead of re-normalizing.
-        if algo == "ippo":
-            T_steps = len(buffer)
-            critic_in = (
-                actor_flat["obs"]
-                .reshape(len(tls_ids), T_steps, obs_dim)
-                .transpose(1, 0, 2)
-            )  # (T, N, obs_dim)
-        else:
-            critic_in = critic_flat["states"]
-
-        state_t = torch.as_tensor(critic_in, dtype=torch.float32, device=device)
-        old_value_t = torch.as_tensor(critic_flat["values"], dtype=torch.float32, device=device)   # (T, N)
-        ret_t = torch.as_tensor(critic_flat["returns"], dtype=torch.float32, device=device)        # (T, N)
-
-        # --------------------------------------------------
-        # PPO update
-        # --------------------------------------------------
-        actor.train()
-        critic.train()
-
-        entropy_coef = get_entropy_coef(
-            global_step, train_cfg.total_timesteps,
-            train_cfg.entropy_coef_start, train_cfg.entropy_coef_end,
-        )
-
-        policy_losses, value_losses, entropies, kls, clip_fracs = [], [], [], [], []
-
-        batch_size_actor = obs_t.shape[0]
-        batch_size_critic = state_t.shape[0]
-
-        actor_indices = np.arange(batch_size_actor)
-        skip_actor = False
-
-        for _ in range(train_cfg.update_epochs):
-
-            if not skip_actor:
-                actor_indices = np.random.permutation(batch_size_actor)
-
-                for start in range(0, batch_size_actor, train_cfg.minibatch_size):
-                    mb_idx = actor_indices[start:start + train_cfg.minibatch_size]
-
-                    dist = actor.distribution(obs_t[mb_idx])
-                    new_logprob = dist.log_prob(action_t[mb_idx])
-                    entropy = dist.entropy().mean()
-
-                    logratio = new_logprob - old_logprob_t[mb_idx]
-                    ratio = torch.exp(logratio)
-
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1.0) - logratio).mean().item()
-                        clip_frac = ((ratio - 1.0).abs() > train_cfg.clip_ratio).float().mean().item()
-
-                    surr1 = ratio * adv_t[mb_idx]
-                    surr2 = torch.clamp(ratio, 1.0 - train_cfg.clip_ratio, 1.0 + train_cfg.clip_ratio) * adv_t[mb_idx]
-                    policy_loss = -torch.min(surr1, surr2).mean()
-
-                    loss_actor = policy_loss - entropy_coef * entropy
-
-                    actor_optim.zero_grad(set_to_none=True)
-                    loss_actor.backward()
-                    nn.utils.clip_grad_norm_(actor.parameters(), train_cfg.max_grad_norm)
-                    actor_optim.step()
-
-                    policy_losses.append(policy_loss.item())
-                    entropies.append(entropy.item())
-                    kls.append(approx_kl)
-                    clip_fracs.append(clip_frac)
-
-                if np.mean(kls) > 1.5 * train_cfg.target_kl:
-                    skip_actor = True
-                    writer.add_scalar("debug/early_stop_kl", 1.0, global_step)
-
-            critic_indices = np.random.permutation(batch_size_critic)
-            critic_mb_size = max(train_cfg.minibatch_size, 1)
-
-            for start in range(0, batch_size_critic, critic_mb_size):
-                mb_idx = critic_indices[start:start + critic_mb_size]
-
-                value_pred = critic(state_t[mb_idx])
-
-                # FIX: use clip_range_vf (not clip_ratio) for value loss clipping
-                value_pred_clipped = old_value_t[mb_idx] + torch.clamp(
-                    value_pred - old_value_t[mb_idx],
-                    -train_cfg.clip_range_vf,
-                    train_cfg.clip_range_vf,
-                )
-
-                value_loss_unclipped = (ret_t[mb_idx] - value_pred).pow(2)
-                value_loss_clipped = (ret_t[mb_idx] - value_pred_clipped).pow(2)
-
-                value_loss = train_cfg.value_coef * torch.max(value_loss_unclipped, value_loss_clipped).mean()
-
-                critic_optim.zero_grad(set_to_none=True)
-                value_loss.backward()
-                nn.utils.clip_grad_norm_(critic.parameters(), train_cfg.max_grad_norm)
-                critic_optim.step()
-
-                value_losses.append(value_loss.item())
-
-        actor_scheduler.step()
-        critic_scheduler.step()
-        current_lr = actor_scheduler.get_last_lr()[0]
-
-        # --------------------------------------------------
-        # Logging
-        # --------------------------------------------------
-        sps = int(global_step / max(time.time() - start_time, 1e-8))
-        ev = explained_variance(
-            critic_flat["values"].reshape(-1), returns_mat.reshape(-1)
-        )
-
-        writer.add_scalar("charts/SPS", sps, global_step)
-        writer.add_scalar("loss/policy", float(np.mean(policy_losses)), global_step)
-        writer.add_scalar("loss/value", float(np.mean(value_losses)), global_step)
-        writer.add_scalar("loss/entropy", float(np.mean(entropies)), global_step)
-        writer.add_scalar("loss/approx_kl", float(np.mean(kls)), global_step)
-        writer.add_scalar("loss/clip_fraction", float(np.mean(clip_fracs)), global_step)
-        writer.add_scalar("loss/explained_variance", ev, global_step)
-        writer.add_scalar("train/lr", current_lr, global_step)
-        writer.add_scalar("train/entropy_coef", entropy_coef, global_step)
-        writer.add_scalar("train/actor_batch_size", batch_size_actor, global_step)
-        writer.add_scalar("train/episode_count", episode_count, global_step)
-        writer.add_scalar("train/return_mean", float(np.mean(returns_mat)), global_step)
-        writer.add_scalar("train/adv_mean", float(np.mean(adv_mat)), global_step)
-        for agent_idx, tls_id in enumerate(tls_ids):
-            writer.add_scalar(f"train/return_mean_{tls_id}", float(np.mean(returns_mat[:, agent_idx])), global_step)
-
-        csv_logger.log_update(
-            global_step=global_step,
-            episode=episode_count,
-            update_idx=update_idx,
-            policy_loss=float(np.mean(policy_losses)),
-            value_loss=float(np.mean(value_losses)),
-            entropy=float(np.mean(entropies)),
-            approx_kl=float(np.mean(kls)),
-            clip_fraction=float(np.mean(clip_fracs)),
-            explained_variance=ev,
-            sps=sps,
-            lr=current_lr,
-            entropy_coef=entropy_coef,
-        )
-
-        # Periodic checkpoint
-        if global_step % train_cfg.save_every_steps < train_cfg.rollout_horizon:
-            ckpt_path = Path(ckpt_dir) / f"checkpoint_{global_step}.pt"
-            torch.save(
-                {
-                    "actor_state_dict": actor.state_dict(),
-                    "critic_state_dict": critic.state_dict(),
-                    "actor_optim_state_dict": actor_optim.state_dict(),
-                    "critic_optim_state_dict": critic_optim.state_dict(),
-                    "actor_scheduler_state_dict": actor_scheduler.state_dict(),
-                    "critic_scheduler_state_dict": critic_scheduler.state_dict(),
-                    "global_step": global_step,
-                    "episode_count": episode_count,
-                    "env_cfg": env_cfg.to_dict(),
-                    "train_cfg": asdict(train_cfg),
-                    "obs_rms": obs_rms.state_dict(),
-                    "state_rms": state_rms.state_dict(),
-                },
-                ckpt_path,
-            )
-
-        # FIX: save last_model.pt per spec (was latest.pt)
-        if update_idx % train_cfg.save_latest_every_updates == 0:
-            torch.save(
-                {
-                    "actor_state_dict": actor.state_dict(),
-                    "critic_state_dict": critic.state_dict(),
-                    "actor_optim_state_dict": actor_optim.state_dict(),
-                    "critic_optim_state_dict": critic_optim.state_dict(),
-                    "actor_scheduler_state_dict": actor_scheduler.state_dict(),
-                    "critic_scheduler_state_dict": critic_scheduler.state_dict(),
-                    "global_step": global_step,
-                    "episode_count": episode_count,
-                    "env_cfg": env_cfg.to_dict(),
-                    "train_cfg": asdict(train_cfg),
-                    "obs_rms": obs_rms.state_dict(),
-                    "state_rms": state_rms.state_dict(),
-                },
-                Path(ckpt_dir) / "last_model.pt",
-            )
-
+        print(f"Training completed. Run dir: {ckpt_dir}")
         print(
-            f"step={global_step:>8} | ep={episode_count:>4} | "
-            f"pi={np.mean(policy_losses):>8.4f} | vf={np.mean(value_losses):>8.4f} | "
-            f"ent={np.mean(entropies):>7.4f} | kl={np.mean(kls):>7.5f} | "
-            f"clip={np.mean(clip_fracs):>6.3f} | lr={current_lr:.2e} | sps={sps:>5}"
+            f"[BENCH] wall-clock {elapsed_s:.1f}s ({elapsed_s/3600:.2f}h) | "
+            f"steps {global_step} | mean SPS {mean_sps:.1f}"
         )
-
-        update_idx += 1
-
-    env.close()
-    writer.close()
-
-    # ----- wall-clock benchmark summary (pilot instrumentation) -----
-    elapsed_s = time.time() - start_time
-    mean_sps = global_step / max(elapsed_s, 1e-9)
-    proj_2m_h = 2_000_000 / max(mean_sps, 1e-9) / 3600.0
-    bench = {
-        "run_id": run_id,
-        "algo": algo,
-        "num_agents": len(tls_ids),
-        "global_steps": global_step,
-        "episodes": episode_count,
-        "elapsed_seconds": round(elapsed_s, 1),
-        "mean_steps_per_second": round(mean_sps, 2),
-        "projected_hours_2M_steps": round(proj_2m_h, 2),
-        "projected_hours_2M_x5_seeds": round(proj_2m_h * 5, 2),
-        "device": train_cfg.device,
-        "ckpt_dir": ckpt_dir,
-        "log_dir": log_dir,
-    }
-    for save_dir in (log_dir, ckpt_dir):
-        with open(Path(save_dir) / "bench.json", "w", encoding="utf-8") as f:
-            json.dump(bench, f, indent=2)
-
-    print(f"Training completed. Run dir: {ckpt_dir}")
-    print(
-        f"[BENCH] wall-clock {elapsed_s:.1f}s ({elapsed_s/3600:.2f}h) | "
-        f"steps {global_step} | mean SPS {mean_sps:.1f}"
-    )
-    print(
-        f"[BENCH] projected: 2M steps ~ {proj_2m_h:.1f}h | "
-        f"2M x 5 seeds ~ {proj_2m_h*5:.1f}h  (algo={algo}, agents={len(tls_ids)})"
-    )
+        print(
+            f"[BENCH] projected: 2M steps ~ {proj_2m_h:.1f}h | "
+            f"2M x 5 seeds ~ {proj_2m_h*5:.1f}h  (algo={algo}, agents={len(tls_ids)})"
+        )
+    finally:
+        if _prev_sigterm is not None and hasattr(signal, "SIGTERM"):
+            try:
+                signal.signal(signal.SIGTERM, _prev_sigterm)
+            except ValueError:
+                pass
+        try:
+            env.close()
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------
@@ -1204,6 +1507,16 @@ def run_multiseed_eval(
     Required for Q2/Q1 paper submission.
     Saves evaluation_results.json next to the checkpoint.
     """
+    sync_obs_mode_from_checkpoint(args)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    validate_checkpoint_schema(
+        args.checkpoint,
+        min_version=MIN_SCHEMA_VERSION,
+        allow_legacy=bool(getattr(args, "allow_legacy_schema", False)),
+        ckpt=ckpt if isinstance(ckpt, dict) else None,
+        require_version=True,
+    )
+
     env, env_cfg = make_env(args)
     tls_ids = list(env_cfg.tls_ids)
     obs_dim = env_cfg.local_obs_dim
@@ -1211,7 +1524,6 @@ def run_multiseed_eval(
 
     device = torch.device(args.device if hasattr(args, "device") else "cpu")
     actor = Actor(obs_dim, action_dim).to(device)
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     actor.load_state_dict(ckpt["actor_state_dict"])
     actor.eval()
 
@@ -1296,6 +1608,16 @@ def run_multiseed_eval(
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(args: argparse.Namespace) -> None:
+    sync_obs_mode_from_checkpoint(args)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    validate_checkpoint_schema(
+        args.checkpoint,
+        min_version=MIN_SCHEMA_VERSION,
+        allow_legacy=bool(getattr(args, "allow_legacy_schema", False)),
+        ckpt=ckpt if isinstance(ckpt, dict) else None,
+        require_version=True,
+    )
+
     cfg = TrainConfig(
         seed=args.seed,
         device=args.device,
@@ -1311,7 +1633,6 @@ def evaluate(args: argparse.Namespace) -> None:
     action_dim = 2
 
     actor = Actor(obs_dim, action_dim).to(device)
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     actor.load_state_dict(ckpt["actor_state_dict"])
     actor.eval()
 
@@ -1401,7 +1722,7 @@ def parse_args() -> argparse.Namespace:
                         help="proxy=camera-computable obs (deployable); "
                              "privileged=proxy + exact-SUMO features (VI-C upper bound)")
     parser.add_argument("--reward-preset", choices=list(REWARD_PRESETS), default="full",
-                        help="VI-F reward ablation (default 'full' = reward 1.2.0)")
+                        help="VI-F reward ablation (default 'full' = reward 1.3.0)")
     parser.add_argument("--obs-ablation", choices=list(OBS_ABLATIONS), default="none",
                         help="VI-F observation ablation (default 'none')")
     parser.add_argument("--shared-reward", action="store_true",
@@ -1412,7 +1733,12 @@ def parse_args() -> argparse.Namespace:
                              "TLS neighbours to its observation (+4 dims/agent) — the "
                              "green-wave coordination signal a local obs lacks; for "
                              "corridor networks (n2_corridor)")
+    parser.add_argument("--no-n2-coordination", action="store_true",
+                        help="Skip auto-enabling --upstream-phase-obs and --shared-reward "
+                             "on n2_corridor (train/eval the uncoordinated corridor base arm)")
     parser.add_argument("--reward-scale", type=float, default=1.0)
+    parser.add_argument("--allow-legacy-schema", action="store_true",
+                        help=f"Allow eval checkpoints with env schema < {MIN_SCHEMA_VERSION}")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--tls-ids", nargs="*", default=[])
 
@@ -1425,15 +1751,20 @@ def _auto_enable_n2_coordination(args: argparse.Namespace) -> None:
     """Corridor networks need the green-wave coordination signal that local
     obs + local reward lack (myopic agents break the platoon chain and lose
     to Max-Pressure). Force both coordination flags whenever the target
-    network is n2_corridor. Applies to eval modes too: an n2 checkpoint
-    trained with --upstream-phase-obs has a wider obs vector, so the eval
-    env must be built with the flag or actor.load_state_dict fails
-    (shared_reward is only read during GAE, harmless at eval)."""
+    network is n2_corridor, unless --no-n2-coordination is passed. Applies to
+    eval modes too: an n2 checkpoint trained with --upstream-phase-obs has a
+    wider obs vector, so the eval env must be built with the flag or
+    actor.load_state_dict fails (shared_reward is only read during GAE,
+    harmless at eval)."""
     paths = (
         getattr(args, "sumo_cfg", None) or "",
         getattr(args, "lane_groups", None) or "",
     )
     if any("n2_corridor" in p for p in paths):
+        if getattr(args, "no_n2_coordination", False):
+            print("[INFO] N2 Corridor detected, --no-n2-coordination set: "
+                  "skipping auto-enable of --upstream-phase-obs and --shared-reward.")
+            return
         args.upstream_phase_obs = True
         args.shared_reward = True
         print("[INFO] N2 Corridor detected: Auto-enabling --upstream-phase-obs "
@@ -1441,6 +1772,7 @@ def _auto_enable_n2_coordination(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    _apply_omp_thread_limit()
     args = parse_args()
     if args.mode == "train":
         train(args)

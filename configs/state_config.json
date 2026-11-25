@@ -329,7 +329,7 @@
     }
   },
   "features": {
-    "_authority_note": "Names/order MUST match DEFAULT_LANE_FEATURE_NAMES + DEFAULT_TLS_FEATURE_NAMES in src/traffic_env/config.py (obs schema 1.2.0). This block is documentation only; no runtime code reads it. Bug D1 fixed 2026-06-15.",
+    "_authority_note": "Names/order MUST match DEFAULT_LANE_FEATURE_NAMES + DEFAULT_TLS_FEATURE_NAMES in src/traffic_env/config.py (obs schema 1.3.0). This block is documentation only; no runtime code reads it. Bug D1 fixed 2026-06-15.",
     "lane_features": [
       {
         "index": 0,

@@ -45,18 +45,22 @@ Usage (from project root)
         --methods mappo ippo privileged webster actuated maxpressure sotl fixed
 
 Outputs (results/paper1_mappo/eval_tables/<network>_<ts>/):
-    summary.json   full per-method per-seed values + aggregates + stats
-    table.csv      one row per (method, metric): mean, ci95, p_adj, cohens_d
+    summary.json         full per-method per-seed values + aggregates + stats
+    table.csv            one row per (method, metric): mean, ci95, p_adj, cohens_d
+    raw_samples.csv      one row per (method, ckpt_idx, train_seed, route_seed)
+    green_durations.csv  one row per realized green phase across all methods
 """
 
 import argparse
+import csv
+import glob
 import json
 import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -70,14 +74,24 @@ from src.traffic_env.config import (
     load_lane_groups_json,
 )
 from src.traffic_env.envs.multi_agent import MappoTrafficEnv
-from src.core.policy_loader import PolicyLoader
-from experiment.common.tripinfo import parse_tripinfo_means
-from experiment.baselines.max_pressure import MaxPressurePolicy
-from experiment.baselines.sotl import SOTLPolicy
+from src.core.policy_loader import (
+    MIN_SCHEMA_VERSION,
+    PolicyLoader,
+    is_legacy_schema_version,
+    validate_checkpoint_schema,
+)
+from experiment.common.tripinfo import parse_tripinfo_means, tripinfo_sumo_args
+from experiment.baselines.max_pressure import (
+    CanonicalMaxPressurePolicy,
+    MaxPressurePolicy,
+)
+from experiment.baselines.sotl import DEFAULT_PHI_MIN, SOTLPolicy
 from experiment.baselines.webster import WebsterPolicy, measure_lane_flows, DEFAULT_PCU
 from experiment.baselines import actuated as actuated_mod
 
 # tripinfo metrics, with optimisation direction (lower-is-better except served).
+# Primary metrics are completed-trips-only; unfinished-inclusive metrics expose
+# controllers that leave vehicles trapped in the network at episode end.
 # CO2/fuel are post-hoc (never in the reward); NaN unless --emissions is set.
 METRIC_KEYS: Tuple[str, ...] = (
     "mean_travel_time_s",
@@ -87,6 +101,9 @@ METRIC_KEYS: Tuple[str, ...] = (
     "n_trips",
     "total_co2_mg",
     "total_fuel_mg",
+    "n_unfinished",
+    "mean_time_loss_incl_unfinished",
+    "mean_travel_time_incl_unfinished",
 )
 LOWER_IS_BETTER: Dict[str, bool] = {
     "mean_travel_time_s": True,
@@ -96,6 +113,9 @@ LOWER_IS_BETTER: Dict[str, bool] = {
     "n_trips": False,  # served trips: higher is better
     "total_co2_mg": True,
     "total_fuel_mg": True,
+    "n_unfinished": True,
+    "mean_time_loss_incl_unfinished": True,
+    "mean_travel_time_incl_unfinished": True,
 }
 METRIC_LABELS: Dict[str, str] = {
     "mean_travel_time_s": "Travel time (s)",
@@ -105,12 +125,34 @@ METRIC_LABELS: Dict[str, str] = {
     "n_trips": "Served trips",
     "total_co2_mg": "CO2 (mg/ep)",
     "total_fuel_mg": "Fuel (mg/ep)",
+    "n_unfinished": "Unfinished trips",
+    "mean_time_loss_incl_unfinished": "Time loss all (s)",
+    "mean_travel_time_incl_unfinished": "Travel all (s)",
 }
 
 # SUMO flag enabling the emissions device for every vehicle (post-hoc CO2/fuel)
 EMISSIONS_FLAGS = ["--device.emissions.probability", "1"]
 
 LEARNED_METHODS = {"mappo", "ippo", "privileged"}
+
+# Deprecated CLI aliases -> canonical method label (A6).
+METHOD_ALIASES: Dict[str, str] = {
+    "maxpressure": "lqi",
+}
+
+# Sensing-class grouping: "camera" (camera-deployable) vs "instrumented"
+# (loop detectors, downstream queues, or exact simulator privileged state).
+SENSING_CLASS: Dict[str, str] = {
+    "mappo": "camera",
+    "ippo": "camera",
+    "fixed": "camera",
+    "webster": "camera",
+    "lqi": "camera",
+    "sotl": "camera",
+    "actuated": "instrumented",
+    "mp": "instrumented",
+    "privileged": "instrumented",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -209,15 +251,14 @@ def run_env_episode(
     tripinfo_path: Path,
     on_reset: Optional[Callable[[], None]] = None,
     extra_args: Optional[List[str]] = None,
+    green_durations_out: Optional[List[Any]] = None,
 ) -> Dict[str, float]:
     """Drive MappoTrafficEnv with an arbitrary action function; return tripinfo means."""
     env = MappoTrafficEnv(
         config=env_cfg,
         gui=False,
         use_libsumo=False,  # traci required for tripinfo flush + parity with baselines
-        extra_sumo_args=[
-            "--tripinfo-output", str(tripinfo_path),
-        ] + list(extra_args or []),
+        extra_sumo_args=tripinfo_sumo_args(tripinfo_path) + list(extra_args or []),
     )
     obs_dict, _ = env.reset(seed=seed)
     if on_reset is not None:
@@ -230,7 +271,9 @@ def run_env_episode(
             if any(terminated.values()) or any(truncated.values()):
                 break
     finally:
-        env.close()  # flushes tripinfo
+        env.close()  # flushes tripinfo + running green durations
+        if green_durations_out is not None:
+            green_durations_out.extend(env.green_durations)
     return parse_tripinfo_means(tripinfo_path)
 
 
@@ -256,7 +299,8 @@ def _obs_mode_for_checkpoint(checkpoint: Path) -> str:
 
 def _obs_overrides_for_checkpoint(checkpoint: Path) -> Dict[str, Any]:
     """Rebuild the EXACT obs space a checkpoint was trained with (incl. VI-F
-    ablations) from its run_config.json, so the actor's input dim matches.
+    ablations and corridor upstream-phase obs) from its run_config.json, so
+    the actor's input dim matches.
     """
     rc = _load_run_config(checkpoint)
     obs = rc.get("env_cfg", {}).get("observation", {})
@@ -265,32 +309,139 @@ def _obs_overrides_for_checkpoint(checkpoint: Path) -> Dict[str, Any]:
         out["lane_feature_names"] = tuple(obs["lane_feature_names"])
     if obs.get("tls_feature_names"):
         out["tls_feature_names"] = tuple(obs["tls_feature_names"])
+    elif "upstream_phase_obs" in rc:
+        out["upstream_phase_obs"] = bool(rc["upstream_phase_obs"])
     return out
 
 
-def resolve_checkpoints(value) -> List[Path]:
-    """Resolve --checkpoint into a concrete list of best_model.pt files.
+_RUN_MARKER_FILES: Tuple[str, ...] = ("bench.json", "best_model.pt", "last_model.pt")
 
-    Accepts a single .pt file, a directory (globbed for **/best_model.pt — the
-    per-seed campaign layout <campaign>/models/<job>/<run_id>/best_model.pt), a
-    glob pattern string, or a list of any of these. Order-preserving + dedup.
+
+def _is_run_dir(path: Path) -> bool:
+    return path.is_dir() and any((path / marker).is_file() for marker in _RUN_MARKER_FILES)
+
+
+def _select_canonical_job_checkpoint(job_dir: Path) -> Path:
+    """Return the single completed ``best_model.pt`` inside ``job_dir``.
+
+    A completed run directory is identified by the presence of ``bench.json``.
+    Raises ``ValueError`` if ``job_dir`` has zero or multiple completed run
+    directories, and ``FileNotFoundError`` if the completed run lacks
+    ``best_model.pt``.
+    """
+    completed_dirs = sorted({p.parent for p in job_dir.glob("**/bench.json") if p.is_file()})
+    if not completed_dirs:
+        raise ValueError(
+            f"Job directory {job_dir} has no completed run directory containing bench.json"
+        )
+    if len(completed_dirs) > 1:
+        raise ValueError(
+            f"Job directory {job_dir} has multiple completed run directories with "
+            f"bench.json ({[str(d) for d in completed_dirs]}); expected exactly one"
+        )
+    ckpt = completed_dirs[0] / "best_model.pt"
+    if not ckpt.is_file():
+        raise FileNotFoundError(
+            f"Completed run directory {completed_dirs[0]} has bench.json but is "
+            f"missing best_model.pt"
+        )
+    return ckpt
+
+
+def _resolve_checkpoint_dir(directory: Path) -> List[Path]:
+    """Resolve a run dir, job dir, or multi-job models dir into canonical best_model.pt paths."""
+    if _is_run_dir(directory):
+        if not (directory / "bench.json").is_file():
+            raise ValueError(
+                f"Run directory {directory} has no bench.json (incomplete run)"
+            )
+        ckpt = directory / "best_model.pt"
+        if not ckpt.is_file():
+            raise FileNotFoundError(
+                f"Completed run directory {directory} has bench.json but is "
+                f"missing best_model.pt"
+            )
+        return [ckpt]
+
+    direct_subdirs = sorted(c for c in directory.iterdir() if c.is_dir())
+    # If any direct child is a run dir, ``directory`` itself is a single job dir.
+    if any(_is_run_dir(c) for c in direct_subdirs):
+        return [_select_canonical_job_checkpoint(directory)]
+
+    # If any direct child itself directly contains a run dir, then ``directory``
+    # is a job-dir container (e.g. <campaign>/models/) and every child dir is a
+    # job dir that must have exactly one completed run.
+    if any(
+        _is_run_dir(gc)
+        for c in direct_subdirs
+        for gc in c.iterdir()
+        if gc.is_dir()
+    ):
+        return [_select_canonical_job_checkpoint(c) for c in direct_subdirs]
+
+    # Otherwise, look for job dirs nested deeper below ``directory`` (e.g. campaign root).
+    run_dirs = sorted(
+        {
+            marker.parent
+            for pat in _RUN_MARKER_FILES
+            for marker in directory.glob(f"**/{pat}")
+            if marker.is_file()
+        }
+    )
+    if not run_dirs:
+        raise ValueError(
+            f"Job directory {directory} has no completed run directory containing bench.json"
+        )
+
+    job_dirs = sorted({r.parent for r in run_dirs})
+    return [_select_canonical_job_checkpoint(jdir) for jdir in job_dirs]
+
+
+def resolve_checkpoints(value) -> List[Path]:
+    """Resolve --checkpoint into a concrete list of canonical ``best_model.pt`` files.
+
+    Accepts a single ``.pt`` file, a run/job/campaign directory, a glob pattern
+    (matching files or job directories), or a list of any of these. Directory
+    and glob resolution return **exact one** ``best_model.pt`` per job directory
+    — the run directory containing ``bench.json`` — and raise a clear error if a
+    job directory has multiple completed run directories or none. Never returns
+    directories. Order-preserving + deduplicated.
     """
     if value is None:
         return []
     items = list(value) if isinstance(value, (list, tuple)) else [value]
     found: List[Path] = []
     for it in items:
-        p = Path(it)
-        if p.is_file():
+        raw = str(it)
+        p = Path(raw)
+        has_glob = any(ch in raw for ch in ("*", "?", "["))
+        if not has_glob and p.is_file():
             found.append(p)
-        elif p.is_dir():
-            found.extend(sorted(p.glob("**/best_model.pt")))
-        else:  # treat as a glob pattern
-            found.extend(sorted(Path().glob(str(it))))
+        elif not has_glob and p.is_dir():
+            found.extend(_resolve_checkpoint_dir(p))
+        else:
+            matches = sorted(Path(m) for m in glob.glob(raw, recursive=True))
+            matched_best_jobs: List[Path] = []
+            seen_jobs: set = set()
+            for m in matches:
+                if m.is_dir():
+                    found.extend(_resolve_checkpoint_dir(m))
+                elif m.is_file():
+                    if m.name == "best_model.pt" and m.parent.parent != m.parent:
+                        jdir = m.parent.parent
+                        rj = jdir.resolve()
+                        if rj not in seen_jobs:
+                            seen_jobs.add(rj)
+                            matched_best_jobs.append(jdir)
+                    else:
+                        found.append(m)
+            for jdir in matched_best_jobs:
+                found.append(_select_canonical_job_checkpoint(jdir))
+
     seen, out = set(), []
     for p in found:
         rp = p.resolve()
-        if rp not in seen and p.exists():
+        if rp not in seen and p.is_file():
             seen.add(rp)
             out.append(p)
     return out
@@ -306,6 +457,64 @@ def _mean_metrics(metric_dicts: Sequence[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+def _train_seed_for_checkpoint(checkpoint: Path) -> Optional[int]:
+    rc = _load_run_config(checkpoint)
+    seed = rc.get("train_cfg", {}).get("seed")
+    if seed is None:
+        return None
+    try:
+        return int(seed)
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_raw_sample(
+    raw_rows: Optional[List[Dict[str, Any]]],
+    method: str,
+    ckpt_idx: int,
+    train_seed: Optional[int],
+    route_seed: int,
+    metrics: Dict[str, float],
+) -> None:
+    if raw_rows is None:
+        return
+    row: Dict[str, Any] = {
+        "method": method,
+        "ckpt_idx": int(ckpt_idx),
+        "train_seed": "" if train_seed is None else int(train_seed),
+        "route_seed": int(route_seed),
+    }
+    for key in METRIC_KEYS:
+        row[key] = metrics.get(key, float("nan"))
+    raw_rows.append(row)
+
+
+def _append_green_durations(
+    green_rows: Optional[List[Dict[str, Any]]],
+    method: str,
+    ckpt_idx: int,
+    route_seed: int,
+    durations: Sequence[Any],
+) -> None:
+    if green_rows is None:
+        return
+    for entry in durations:
+        if len(entry) == 4:
+            tls_id, phase, duration_s, completed = entry
+        else:
+            tls_id, phase, duration_s = entry
+            completed = bool(getattr(entry, "completed", True))
+        green_rows.append({
+            "method": method,
+            "ckpt_idx": int(ckpt_idx),
+            "route_seed": int(route_seed),
+            "tls_id": str(tls_id),
+            "phase": int(phase),
+            "duration_s": float(duration_s),
+            "completed": bool(completed),
+        })
+
+
 def eval_learned(
     method: str,
     checkpoints: Sequence[Path],
@@ -313,21 +522,38 @@ def eval_learned(
     args: argparse.Namespace,
     seeds: Sequence[int],
     tmp: Path,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, float]]:
     """Evaluate every per-seed checkpoint; sample = one checkpoint's mean over
     the eval route-seeds, so n_samples == number of training seeds (the policy
     variance source). With a single checkpoint this degrades to a point estimate.
     """
+    allow_legacy = bool(getattr(args, "allow_legacy_schema", False))
+    for ckpt in checkpoints:
+        validate_checkpoint_schema(
+            ckpt,
+            min_version=MIN_SCHEMA_VERSION,
+            allow_legacy=allow_legacy,
+            require_version=True,
+        )
+
     l_step, l_max_steps = _learned_timing(args)
     samples: List[Dict[str, float]] = []
     for ci, ckpt in enumerate(checkpoints):
         obs_mode = _obs_mode_for_checkpoint(ckpt)
+        train_seed = _train_seed_for_checkpoint(ckpt)
         env_cfg = _build_env_cfg(scenario, args, obs_mode,
                                  obs_overrides=_obs_overrides_for_checkpoint(ckpt),
                                  step_length=l_step, max_steps=l_max_steps)
         obs_dim = env_cfg.local_obs_dim
         policy = PolicyLoader(
-            checkpoint_path=ckpt, obs_dim=obs_dim, action_dim=2,
+            checkpoint_path=ckpt,
+            obs_dim=obs_dim,
+            action_dim=2,
+            min_schema_version=MIN_SCHEMA_VERSION,
+            allow_legacy_schema=allow_legacy,
+            require_schema_version=True,
         ).load()
 
         def make_action(env, obs_dict, step, step_len, _p=policy):
@@ -340,14 +566,25 @@ def eval_learned(
         seed_metrics: List[Dict[str, float]] = []
         for seed in seeds:
             tri = tmp / f"{method}_c{ci}_{seed}.xml"
-            m = run_env_episode(env_cfg, make_action, seed, l_max_steps, tri, extra_args=emi)
+            ep_greens: List[Tuple[str, int, float]] = []
+            m = run_env_episode(
+                env_cfg, make_action, seed, l_max_steps, tri,
+                extra_args=emi, green_durations_out=ep_greens,
+            )
             seed_metrics.append(m)
+            _append_raw_sample(raw_rows, method, ci, train_seed, seed, m)
+            _append_green_durations(green_rows, method, ci, seed, ep_greens)
             _log_seed(f"{method}[{ci}]", seed, m)
         samples.append(_mean_metrics(seed_metrics))
     return samples
 
 
-def eval_maxpressure(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
+def eval_lqi(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
+    """Local Queue-Imbalance (camera-deployable, incoming queues only)."""
     env_cfg = _build_env_cfg(scenario, args, obs_mode="proxy")
     policy = MaxPressurePolicy(lane_groups=scenario.lane_groups)
 
@@ -355,25 +592,72 @@ def eval_maxpressure(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
         lane_cache = env.obs_builder.build_lane_cache(env.tls_ids)
         return policy.select_actions(lane_cache)
 
-    return _run_seeds("maxpressure", env_cfg, make_action, args, seeds, tmp)
+    return _run_seeds(
+        "lqi", env_cfg, make_action, args, seeds, tmp,
+        raw_rows=raw_rows, green_rows=green_rows,
+    )
 
 
-def eval_sotl(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
+eval_maxpressure = eval_lqi  # backward-compatible alias
+
+
+def eval_mp(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
+    """Canonical Varaiya (2013) Max-Pressure (INSTRUMENTED: uses downstream queues)."""
+    env_cfg = _build_env_cfg(scenario, args, obs_mode="proxy")
+    policy = CanonicalMaxPressurePolicy(lane_groups=scenario.lane_groups)
+
+    def make_action(env, obs_dict, step, step_len):
+        return policy.select_actions(env.sumo_conn)
+
+    return _run_seeds(
+        "mp", env_cfg, make_action, args, seeds, tmp,
+        on_reset=policy.reset, raw_rows=raw_rows, green_rows=green_rows,
+    )
+
+
+def eval_sotl(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
     env_cfg = _build_env_cfg(scenario, args, obs_mode="proxy")
     policy = SOTLPolicy(
         lane_groups=scenario.lane_groups,
-        phi_min=args.phi_min, phi_max=args.phi_max, kappa=args.kappa,
+        phi_min=args.phi_min,
+        phi_max=args.phi_max,
+        kappa=args.kappa,
+        step_length=env_cfg.sim.step_length,
+        yellow_time=env_cfg.sim.yellow_time,
     )
 
     def make_action(env, obs_dict, step, step_len):
         lane_cache = env.obs_builder.build_lane_cache(env.tls_ids)
-        return policy.select_actions(lane_cache)
+        current_actions = {
+            t: env._green_phase_map[t].index(env._current_green_phase[t])
+            for t in env.tls_ids
+            if t in env._green_phase_map and env._current_green_phase.get(t) in env._green_phase_map[t]
+        }
+        return policy.select_actions(
+            lane_cache,
+            green_timers=env.green_timers,
+            current_actions=current_actions,
+        )
 
-    return _run_seeds("sotl", env_cfg, make_action, args, seeds, tmp,
-                      on_reset=policy.reset)
+    return _run_seeds(
+        "sotl", env_cfg, make_action, args, seeds, tmp,
+        on_reset=policy.reset, raw_rows=raw_rows, green_rows=green_rows,
+    )
 
 
-def eval_fixed(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
+def eval_fixed(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
     env_cfg = _build_env_cfg(scenario, args, obs_mode="proxy")
     green_steps = max(1, round(args.fixed_green_s / env_cfg.sim.step_length))
 
@@ -381,10 +665,17 @@ def eval_fixed(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
         phase = (step // green_steps) % 2
         return {t: phase for t in env.tls_ids}
 
-    return _run_seeds("fixed", env_cfg, make_action, args, seeds, tmp)
+    return _run_seeds(
+        "fixed", env_cfg, make_action, args, seeds, tmp,
+        raw_rows=raw_rows, green_rows=green_rows,
+    )
 
 
-def eval_webster(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
+def eval_webster(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
     """Per seed: measure historical flows (static program) then drive WebsterPolicy."""
     env_cfg = _build_env_cfg(scenario, args, obs_mode="proxy")
     all_lanes = [l for ga, gb in scenario.lane_groups.values() for l in list(ga) + list(gb)]
@@ -398,6 +689,8 @@ def eval_webster(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
         policy = WebsterPolicy(
             lane_groups=scenario.lane_groups, lane_flows_pcu_h=flows,
             sat_flow_pcu_h=args.sat_flow,
+            min_green=float(args.min_green_time),
+            max_green=float(args.max_green_time),
         )
 
         def make_action(env, obs_dict, step, step_len, _p=policy):
@@ -405,40 +698,66 @@ def eval_webster(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
 
         emi = EMISSIONS_FLAGS if getattr(args, "emissions", False) else []
         tri = tmp / f"webster_{seed}.xml"
-        m = run_env_episode(env_cfg, make_action, seed, args.max_steps, tri, extra_args=emi)
+        ep_greens: List[Any] = []
+        m = run_env_episode(
+            env_cfg, make_action, seed, args.max_steps, tri,
+            extra_args=emi, green_durations_out=ep_greens,
+        )
         results.append(m)
+        _append_raw_sample(raw_rows, "webster", -1, None, seed, m)
+        _append_green_durations(green_rows, "webster", -1, seed, ep_greens)
         _log_seed("webster", seed, m)
     return results
 
 
-def eval_actuated(scenario, args, seeds, tmp) -> List[Dict[str, float]]:
+def eval_actuated(
+    scenario, args, seeds, tmp,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, float]]:
     """SUMO-native gap-based actuated; runs its own program (not via the env)."""
-    add_path = scenario.net_path.parent / "tls_actuated.add.xml"
-    tls_ids = actuated_mod.write_actuated_add(scenario.net_path, add_path)
+    add_path = tmp / "tls_actuated.add.xml"
+    tls_ids = actuated_mod.write_actuated_add(
+        scenario.net_path,
+        add_path,
+        min_green=args.min_green_time,
+        max_green=args.max_green_time,
+    )
     duration = args.max_steps * args.step_length
     emi = EMISSIONS_FLAGS if getattr(args, "emissions", False) else None
 
     results = []
     for seed in seeds:
         tri = tmp / f"actuated_{seed}.xml"
-        actuated_mod.run_actuated(
+        ep_greens = actuated_mod.run_actuated(
             scenario.sumo_cfg, add_path, scenario.vtypes_path,
             tls_ids, seed, duration, tri, extra_args=emi,
         )
         m = parse_tripinfo_means(tri)
         results.append(m)
+        _append_raw_sample(raw_rows, "actuated", -1, None, seed, m)
+        _append_green_durations(green_rows, "actuated", -1, seed, ep_greens)
         _log_seed("actuated", seed, m)
     return results
 
 
-def _run_seeds(method, env_cfg, make_action, args, seeds, tmp, on_reset=None):
+def _run_seeds(
+    method, env_cfg, make_action, args, seeds, tmp, on_reset=None,
+    raw_rows: Optional[List[Dict[str, Any]]] = None,
+    green_rows: Optional[List[Dict[str, Any]]] = None,
+):
     emi = EMISSIONS_FLAGS if getattr(args, "emissions", False) else []
     results = []
     for seed in seeds:
         tri = tmp / f"{method}_{seed}.xml"
-        m = run_env_episode(env_cfg, make_action, seed, args.max_steps, tri,
-                            on_reset=on_reset, extra_args=emi)
+        ep_greens: List[Tuple[str, int, float]] = []
+        m = run_env_episode(
+            env_cfg, make_action, seed, args.max_steps, tri,
+            on_reset=on_reset, extra_args=emi, green_durations_out=ep_greens,
+        )
         results.append(m)
+        _append_raw_sample(raw_rows, method, -1, None, seed, m)
+        _append_green_durations(green_rows, method, -1, seed, ep_greens)
         _log_seed(method, seed, m)
     return results
 
@@ -582,7 +901,15 @@ def print_table(aggregates, report) -> None:
     print("=" * (24 + col_w * len(methods)) + "\n")
 
 
-def write_outputs(out_dir: Path, scenario_name: str, aggregates, report, args) -> None:
+def write_outputs(
+    out_dir: Path,
+    scenario_name: str,
+    aggregates,
+    report,
+    args,
+    raw_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    green_rows: Optional[Sequence[Dict[str, Any]]] = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "scenario": scenario_name,
@@ -594,12 +921,12 @@ def write_outputs(out_dir: Path, scenario_name: str, aggregates, report, args) -
         "min_green_time": args.min_green_time,
         "max_green_time": args.max_green_time,
         "reference": report["reference"],
+        "sensing_class": {m: SENSING_CLASS.get(m, "camera") for m in aggregates},
         "aggregates": aggregates,
         "stats": report["stats"],
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    import csv
     ref = report["reference"]
     with open(out_dir / "table.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -616,20 +943,66 @@ def write_outputs(out_dir: Path, scenario_name: str, aggregates, report, args) -
                     f"{st.get('cohens_d', float('nan')):.4g}" if method != ref else "",
                     f"{st.get('pct_improvement_ref_vs_method', float('nan')):.2f}" if method != ref else "",
                 ])
-    print(f"[out] wrote {out_dir/'summary.json'} and {out_dir/'table.csv'}")
+
+    raw_fields = ["method", "ckpt_idx", "train_seed", "route_seed", *METRIC_KEYS]
+    with open(out_dir / "raw_samples.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(raw_fields)
+        for row in (raw_rows or ()):
+            vals = [row["method"], row["ckpt_idx"], row["train_seed"], row["route_seed"]]
+            for key in METRIC_KEYS:
+                v = float(row.get(key, float("nan")))
+                if key in ("n_trips", "n_unfinished") and np.isfinite(v):
+                    vals.append(int(round(v)))
+                else:
+                    vals.append(f"{v:.4f}" if np.isfinite(v) else "nan")
+            w.writerow(vals)
+
+    green_fields = ["method", "ckpt_idx", "route_seed", "tls_id", "phase", "duration_s", "completed"]
+    with open(out_dir / "green_durations.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(green_fields)
+        for row in (green_rows or ()):
+            w.writerow([
+                row["method"],
+                row["ckpt_idx"],
+                row["route_seed"],
+                row["tls_id"],
+                row["phase"],
+                f"{float(row['duration_s']):.2f}",
+                bool(row.get("completed", True)),
+            ])
+
+    print(
+        f"[out] wrote {out_dir/'summary.json'}, {out_dir/'table.csv'}, "
+        f"{out_dir/'raw_samples.csv'}, and {out_dir/'green_durations.csv'}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _resolve_methods(raw_methods: Sequence[str]) -> List[str]:
+    """Map deprecated CLI aliases (maxpressure -> lqi) and deduplicate."""
+    resolved: List[str] = []
+    for raw_m in raw_methods:
+        m = METHOD_ALIASES.get(raw_m, raw_m)
+        if m != raw_m:
+            print(f"[warn] method {raw_m!r} is deprecated; mapped to {m!r} (local queue-imbalance)")
+        if m not in resolved:
+            resolved.append(m)
+    return resolved
+
+
 def run(args: argparse.Namespace) -> dict:
     scenario = resolve_scenario(args)
     seeds = list(args.seeds)
     scenario_name = args.network or Path(args.sumo_cfg).parent.name
+    methods = _resolve_methods(args.methods)
 
     print(f"\nScenario: {scenario_name} ({args.split}) | {len(scenario.tls_ids)} TLS | "
-          f"{len(seeds)} seeds | methods: {', '.join(args.methods)}")
+          f"{len(seeds)} seeds | methods: {', '.join(methods)}")
 
     lsl = getattr(args, "learned_step_length", None)
     if lsl is not None:
@@ -647,13 +1020,34 @@ def run(args: argparse.Namespace) -> dict:
         "privileged": resolve_checkpoints(args.privileged_checkpoint),
     }
 
+    allow_legacy = bool(getattr(args, "allow_legacy_schema", False))
+    for method in methods:
+        if method in LEARNED_METHODS:
+            for ckpt in checkpoints.get(method, []):
+                ver = validate_checkpoint_schema(
+                    ckpt,
+                    min_version=MIN_SCHEMA_VERSION,
+                    allow_legacy=allow_legacy,
+                    require_version=True,
+                )
+                if allow_legacy and is_legacy_schema_version(ver, MIN_SCHEMA_VERSION):
+                    print(
+                        f"[warn] {method}: allowing legacy checkpoint {ckpt} with env schema "
+                        f"{ver!r} (< {MIN_SCHEMA_VERSION!r}) via --allow-legacy-schema"
+                    )
+
     tmp = Path(args.tmp_dir) if args.tmp_dir else Path(tempfile.gettempdir()) / "eval_compare"
     tmp.mkdir(parents=True, exist_ok=True)
 
     aggregates: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for method in args.methods:
+    raw_rows: List[Dict[str, Any]] = []
+    green_rows: List[Dict[str, Any]] = []
+
+    for method in methods:
         t0 = time.time()
         print(f"\n--- {method} ---")
+        method_raw_rows: List[Dict[str, Any]] = []
+        method_green_rows: List[Dict[str, Any]] = []
         try:
             if method in LEARNED_METHODS:
                 ckpts = checkpoints.get(method, [])
@@ -661,37 +1055,69 @@ def run(args: argparse.Namespace) -> dict:
                     print(f"  [skip] {method}: no checkpoint(s) found")
                     continue
                 print(f"  {len(ckpts)} checkpoint(s) x {len(seeds)} eval seeds")
-                per_seed = eval_learned(method, ckpts, scenario, args, seeds, tmp)
-            elif method == "maxpressure":
-                per_seed = eval_maxpressure(scenario, args, seeds, tmp)
+                per_seed = eval_learned(
+                    method, ckpts, scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
+            elif method == "lqi":
+                per_seed = eval_lqi(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
+            elif method == "mp":
+                per_seed = eval_mp(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
             elif method == "sotl":
-                per_seed = eval_sotl(scenario, args, seeds, tmp)
+                per_seed = eval_sotl(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
             elif method == "webster":
-                per_seed = eval_webster(scenario, args, seeds, tmp)
+                per_seed = eval_webster(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
             elif method == "actuated":
-                per_seed = eval_actuated(scenario, args, seeds, tmp)
+                per_seed = eval_actuated(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
             elif method == "fixed":
-                per_seed = eval_fixed(scenario, args, seeds, tmp)
+                per_seed = eval_fixed(
+                    scenario, args, seeds, tmp,
+                    raw_rows=method_raw_rows, green_rows=method_green_rows,
+                )
             else:
                 print(f"  [skip] unknown method {method!r}")
                 continue
+            aggregates[method] = aggregate(per_seed)
         except Exception as exc:  # one method failing must not kill the campaign
             print(f"  [error] {method} failed: {type(exc).__name__}: {exc}")
             continue
-        aggregates[method] = aggregate(per_seed)
+        raw_rows.extend(method_raw_rows)
+        green_rows.extend(method_green_rows)
         print(f"  ({time.time()-t0:.1f}s)")
 
     if not aggregates:
         raise SystemExit("[eval] no method produced results")
 
-    reference = args.reference if args.reference in aggregates else next(iter(aggregates))
+    ref_arg = METHOD_ALIASES.get(args.reference, args.reference)
+    reference = ref_arg if ref_arg in aggregates else next(iter(aggregates))
     report = build_report(aggregates, reference)
 
     print_table(aggregates, report)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = _ROOT / "results" / "paper1_mappo" / "eval_tables" / f"{scenario_name}_{ts}"
-    write_outputs(out_dir, scenario_name, aggregates, report, args)
+    if getattr(args, "out_dir", None):
+        out_dir = Path(args.out_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = _ROOT / "results" / "paper1_mappo" / "eval_tables" / f"{scenario_name}_{ts}"
+    write_outputs(
+        out_dir, scenario_name, aggregates, report, args,
+        raw_rows=raw_rows, green_rows=green_rows,
+    )
     return {"aggregates": aggregates, "report": report, "out_dir": str(out_dir)}
 
 
@@ -709,15 +1135,16 @@ def parse_args() -> argparse.Namespace:
     _force_utf8_stdout()
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid"], default=None)
+    p.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"], default=None)
     p.add_argument("--split", choices=["train", "eval"], default="eval")
     p.add_argument("--sumo-cfg", type=str, default=None,
                    help="explicit cfg (alternative to --network)")
     p.add_argument("--lane-groups", type=str, default=None,
                    help="lane_groups.json (with --sumo-cfg); else DEFAULT_MANUAL_LANE_GROUPS")
     p.add_argument("--methods", nargs="+",
-                   default=["mappo", "webster", "actuated", "maxpressure", "sotl", "fixed"],
-                   help="subset of: mappo ippo privileged webster actuated maxpressure sotl fixed")
+                   default=["mappo", "webster", "actuated", "lqi", "mp", "sotl", "fixed"],
+                   help="subset of: mappo ippo privileged webster actuated lqi mp sotl fixed "
+                        "(deprecated alias: maxpressure -> lqi)")
     p.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456, 789, 1337])
     p.add_argument("--reference", type=str, default="mappo",
                    help="method to test others against (Mann-Whitney/Holm/Cohen)")
@@ -729,6 +1156,15 @@ def parse_args() -> argparse.Namespace:
                    help="MAPPO checkpoint(s): file / dir / glob (per-seed → CI)")
     p.add_argument("--ippo-checkpoint", nargs="+", default=None)
     p.add_argument("--privileged-checkpoint", nargs="+", default=None)
+    p.add_argument(
+        "--allow-legacy-schema",
+        action="store_true",
+        help=(
+            f"Allow learned checkpoints with env schema < {MIN_SCHEMA_VERSION} "
+            f"(or missing run_config version). Off by default because paper "
+            f"results require schema >= {MIN_SCHEMA_VERSION}."
+        ),
+    )
 
     p.add_argument("--emissions", action="store_true",
                    help="enable SUMO emissions device -> post-hoc CO2/fuel per episode (TABLE-10)")
@@ -746,12 +1182,14 @@ def parse_args() -> argparse.Namespace:
 
     # baseline hyperparameters
     p.add_argument("--fixed-green-s", type=float, default=30.0)
-    p.add_argument("--phi-min", type=int, default=2)
+    p.add_argument("--phi-min", type=int, default=DEFAULT_PHI_MIN)
     p.add_argument("--phi-max", type=int, default=12)
     p.add_argument("--kappa", type=int, default=5)
     p.add_argument("--sat-flow", type=float, default=1800.0)
 
     p.add_argument("--tmp-dir", type=str, default=None)
+    p.add_argument("--out-dir", type=str, default=None,
+                   help="explicit output directory (default: results/paper1_mappo/eval_tables/<scenario>_<ts>)")
     return p.parse_args()
 
 

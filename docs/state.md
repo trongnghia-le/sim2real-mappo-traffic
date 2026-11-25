@@ -1,18 +1,20 @@
 # State Space Review — Train/Deploy Gap Analysis
 
 **System:** MAPPO Traffic Signal Control  
-**Reviewed:** 2026-06-08; updated 2026-06-12 for **obs schema 1.1.0** (S1/S2/S3 fixes — see §12)  
+**Reviewed:** 2026-06-08; updated for **schema 1.3.0** (obs 26-dim layout unchanged since 1.1.0 S1/S2/S3 fixes; approach-level reward, enforced timing bounds, and camera stop-line exit counter added in 1.3.0 — see §12)  
 **Reviewer scope:** Every feature in the 26-dim per-agent observation vector, cross-checked between
 `src/traffic_env/components/observations.py` (SUMO/training) and
 `src/vision/state_extractor.py` (YOLO+ByteTrack/deployment).
 
-> **LEGACY WARNING:** checkpoint `20260418_215140` was trained on the
-> pre-1.1.0 schema (per-lane slots, unsigned pressure) and is invalid for
-> paper results. All results require retraining with `env_cfg.version >= 1.1.0`.
+> **LEGACY WARNING:** All paper results require `env_cfg.version >= 1.3.0`
+> (guarded by `PolicyLoader` and `eval_compare.py`). All 1.2.0-era checkpoints
+> (per-lane reward, un-enforced env max-green) and legacy pre-1.1.0 checkpoint
+> `20260418_215140` (per-lane slots, unsigned pressure) are invalid for paper
+> results.
 
 ---
 
-## 1. Observation Vector Layout (schema 1.1.0)
+## 1. Observation Vector Layout (schema 1.3.0; layout unchanged since 1.1.0)
 
 ```
 Per agent (26 dims):
@@ -47,6 +49,12 @@ Lanes are grouped by parent edge (`lane_id.rsplit("_", 1)[0]`) in
 approach, so slot k = ROI k — **ROI order must match the training approach
 order**; verify with `python scripts/check_obs_match.py --sumo`.
 
+**Privileged-observation reference (`obs_mode="privileged"`):** appends 3 exact
+simulator features per approach (`privileged_halt_count_norm`,
+`privileged_waiting_norm`, `privileged_vehicle_count_norm` → 8 features × 4
+approaches + 6 TLS = **38 dims/agent**) while holding the reward fixed, to
+quantify the observation-restriction cost.
+
 ---
 
 ## 2. System Parameters That Affect All Features
@@ -55,9 +63,11 @@ order**; verify with `python scripts/check_obs_match.py --sumo`.
 |---|---|---|
 | `fps` | 10 Hz | `configs/state_config.json` |
 | `speed_cap` | 15.0 m/s | `state_config.json`, `config.py` |
-| `max_green_time` | 60 s | `state_config.json`, `config.py` |
+| `min_green_time` | 15 s (enforced for all controllers) | `config.py`, `multi_agent.py`, baselines |
+| `max_green_time` | 60 s (enforced for all controllers via forced yellow switch) | `state_config.json`, `config.py`, `multi_agent.py` |
 | `px_per_meter` | 20.0 px/m | `state_config.json` |
 | `halt_threshold` | 0.1 m/s | `state_extractor.py`, `observations.py` |
+| `min_track_frames` | 3 frames (stop-line exit counter) | `state_extractor.py` |
 | `max_lanes_per_tls` | 4 | `state_config.json`, `config.py` |
 | SUMO step length | 5 s | `config.py:SimConfig.step_length` |
 | EMA alpha (VisionBuffer) | 0.6 | `state_config.json`, `vision_buffer.py` |
@@ -316,7 +326,7 @@ green, the patch is missing. `check_obs_match.py` Check 2 covers this.
 
 #### SUMO (training)
 - **Source:** `multi_agent.py` `green_timers` dict
-- **Method:** timer starts at 0 on phase switch; incremented by `step_length` (5 s) each step; capped at `max_green_time` (60 s)
+- **Method:** timer starts at residual post-yellow green (`step_length - yellow_time = 2 s`) on phase switch (0 s on reset); incremented by `step_length` (5 s) each step; capped at `max_green_time` (60 s). Since schema **1.3.0**, `MappoTrafficEnv` enforces both `min_green_time = 15 s` and `max_green_time = 60 s` for **all** env-driven controllers (forcing a switch through yellow whenever holding another full step would push realized green past 60 s; e.g., 2 + 11×5 = 57 s ≤ 60 s).
 - `green_timer_norm = green_timer / max_green_time`
 - **Unit:** ∈ [0, 1]
 - **Update freq:** every 5 s
@@ -332,13 +342,12 @@ green, the patch is missing. `check_obs_match.py` Check 2 covers this.
 |---|---|---|
 | Wall-clock drift vs simulation time | Negligible — real-time control | No |
 | System startup: timer initialises to 0 for both TLS | Harmless — same as SUMO episode reset | — |
-| `max_green_time` default (90 s in StateExtractor) vs training (60 s) | HIGH if orchestrator does not override | Yes — load from state_config.json |
+| Legacy `max_green_time` default (was 90 s in `StateExtractor`, patched to 60 s in Patch 3) vs training (60 s) | LOW after Patch 3 | Yes — load from `state_config.json` |
 
 #### Deployment Mismatch Assessment
 - **Formula:** IDENTICAL
-- **Risk level:** LOW (if orchestrator loads `max_green_time` from config)
-- **Risk level:** HIGH (if orchestrator uses `StateExtractor` default of 90 s)
-- **Verified:** `state_config.json` has `max_green_time: 60`. Orchestrators must pass this explicitly to `StateExtractor`.
+- **Risk level:** LOW (both `state_config.json` and `StateExtractor` default to `max_green_time=60`)
+- **Verified:** `state_config.json` and `StateExtractor.__init__` both use `max_green_time: 60`. Orchestrators should still pass it explicitly from config.
 
 ---
 
@@ -389,10 +398,10 @@ reliability bar defined below.
 - **Camera equivalent:** none reliable. Would require tracking the same track ID across hundreds of frames without ID switch. ByteTrack loses IDs in occluded/dense scenarios.
 - **Verdict: REJECT.** Cannot be measured reliably from camera. `StateExtractor` accumulates per-track stop memory but it resets on track loss. Not in active obs vector — do not add.
 
-### 4.2 `throughput` (vehicles exiting per second)
-- **SUMO source:** vehicles teleported off edge / exiting the lane polygon per time step
-- **Camera equivalent:** count tracks whose centroid crosses the ROI boundary (exit event). Extremely noise-prone — occlusion causes track loss that looks identical to a true exit.
-- **Verdict: REJECT.** False-positive exit rate from tracking loss would inject large noise. Not in active obs vector. Documented in `state_config.json:features[5]` but NOT implemented anywhere in code — confirmed documentation drift.
+### 4.2 `throughput` (approach exits per step)
+- **SUMO source:** per-approach union of `vehicle_ids` differenced across steps (`|ids_{t-1}(a) \ ids_t(a)|`) — used in the **reward** (`docs/reward.md` §2.3), not in the observation vector.
+- **Camera counterpart (schema 1.3.0):** `src/vision/state_extractor.py` implements a minimal stop-line exit counter (`LaneROI.stop_line` 2-point directed segment, bbox bottom-centre crossing in the exit direction, `min_track_frames=3`, counted at most once per track ID, exposed per decision step via `StateExtractor.get_step_exits()` and `build_state(..., return_info=True)["approach_exits"]`). A track disappearing inside the ROI without crossing the stop line is NOT counted as an exit.
+- **Verdict for RL obs: REJECT.** Kept out of the 26-dim observation vector (used only as the camera-side counterpart of the training reward's approach-exit throughput term).
 
 ### 4.3 `queue_length` (stopped vehicle count)
 - **SUMO source:** count of vehicles with speed ≤ 0.1 m/s
@@ -458,25 +467,9 @@ If a sudden density change occurs (e.g., a queue dissolves in one green cycle), 
 
 ---
 
-## 7. State Config Documentation Drift
+## 7. State Config Documentation Drift (FIXED — Bug D1)
 
-`configs/state_config.json:features` documents a **different, older observation space** that is not implemented anywhere in the current codebase:
-
-| JSON field | JSON says | Reality |
-|---|---|---|
-| `lane_features[0]` | `vehicle_count` | Not in obs vector |
-| `lane_features[1]` | `queue_length` | Not in obs vector |
-| `lane_features[2]` | `waiting_time` | Not in obs vector |
-| `lane_features[3]` | `avg_speed` | Not the same as `avg_speed_norm` (index 2) |
-| `lane_features[4]` | `occupancy` | Corresponds to `occupancy_norm` (index 1) — wrong index |
-| `lane_features[5]` | `throughput` | Not implemented anywhere |
-| `tls_features[0]` | `pressure` (tanh-normalised) | Actual normalisation is `/max_lanes`, not tanh |
-| `tls_features[1]` | `phase_id` | Actual is 4-dim one-hot, not scalar |
-| `tls_features[2]` | `time_in_phase` | Corresponds to `green_timer_norm` — wrong name and wrong max (90 s vs 60 s) |
-| `tls_features[3]` | `accident_flag` | Not in obs vector |
-
-**Action required:** Update `state_config.json:features` to reflect the actual implemented obs space.
-The authoritative source is `DEFAULT_LANE_FEATURE_NAMES` and `DEFAULT_TLS_FEATURE_NAMES` in `config.py`.
+Historically `configs/state_config.json:features` documented an older observation space (6 lane features including `vehicle_count`/`queue_length`/`waiting_time`/`throughput`, and 4 TLS features with scalar `phase_id` and `accident_flag`). **Bug D1 (fixed 2026-06-15, updated to schema 1.3.0):** `configs/state_config.json:features` now matches `DEFAULT_LANE_FEATURE_NAMES` and `DEFAULT_TLS_FEATURE_NAMES` in `src/traffic_env/config.py` (documentation only; no runtime code reads it). `config.py` remains the single authoritative source of truth.
 
 ---
 
@@ -732,5 +725,28 @@ baseline) mixed in another junction's queues.
 
 Reward revision **1.2.0** (mean-of-squares queue, signed pressure reward,
 local lane-exit throughput) followed the same day — documented in
-`docs/reward.md`. The obs schema was deliberately left unchanged at 26-dim
-for the W5 campaign.
+`docs/reward.md`.
+
+### Schema 1.3.0 — Approach-Level Alignment, Timing Bounds, and Vision Exit Counter
+
+- **Obs layout unchanged** at 26 dims per agent (`proxy`; 38 dims for the
+  `privileged` privileged-observation reference); all paper results now require
+  `env_cfg.version >= 1.3.0` (all 1.2.0-era checkpoints are invalid, enforced
+  by `PolicyLoader` and `eval_compare.py`).
+- **Approach-level reward & `queue_occupancy`:** every reward term now operates
+  on approach aggregates matching `ObservationBuilder`, local throughput diffs
+  per-approach vehicle-ID unions (intra-approach lane changes = 0 exits), and
+  weight key `waiting_time` is renamed `queue_occupancy` (with backward-compatible
+  fallback) — see `docs/reward.md`. Every reward term has a camera-side
+  computation at approach granularity; a separate `--reward-preset privileged`
+  ablation keeps the 26-dim camera obs with an exact-simulator reward.
+- **Timing bounds enforced for all controllers:** `min_green_time = 15 s` and
+  `max_green_time = 60 s` are enforced across `MappoTrafficEnv` (forced yellow
+  switch before realized green can exceed 60 s), SOTL (`phi_min = 3`), Webster,
+  and SUMO-actuated (`minDur = 15`, `maxDur = 60`).
+- **Camera-side stop-line exits:** `src/vision/state_extractor.py` adds
+  `LaneROI.stop_line`, `min_track_frames=3`, and `StateExtractor.get_step_exits()`
+  as the camera counterpart to approach-exit throughput.
+- **Baselines split:** old `maxpressure` is renamed `lqi` (camera-deployable,
+  incoming queues only) and canonical Varaiya max-pressure `mp` (downstream
+  queues via `getLinks`) is added as an instrumented reference.

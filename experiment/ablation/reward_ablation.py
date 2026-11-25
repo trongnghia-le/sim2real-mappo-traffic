@@ -57,7 +57,7 @@ ABLATION_CONFIGS: List[AblationConfig] = [
             "throughput":        +1.0,
             "switch_penalty":    -0.1,
             "low_speed_penalty": -0.2,
-            "waiting_time":      -0.3,
+            "queue_occupancy":   -0.3,
         },
     ),
     AblationConfig(
@@ -69,7 +69,7 @@ ABLATION_CONFIGS: List[AblationConfig] = [
             "throughput":        +1.0,
             "switch_penalty":    -0.1,
             "low_speed_penalty": -0.2,
-            "waiting_time":      -0.3,
+            "queue_occupancy":   -0.3,
         },
     ),
     AblationConfig(
@@ -81,7 +81,7 @@ ABLATION_CONFIGS: List[AblationConfig] = [
             "throughput":         0.0,
             "switch_penalty":    -0.1,
             "low_speed_penalty": -0.2,
-            "waiting_time":      -0.3,
+            "queue_occupancy":   -0.3,
         },
     ),
     AblationConfig(
@@ -93,7 +93,7 @@ ABLATION_CONFIGS: List[AblationConfig] = [
             "throughput":         0.0,
             "switch_penalty":     0.0,
             "low_speed_penalty":  0.0,
-            "waiting_time":       0.0,
+            "queue_occupancy":    0.0,
         },
     ),
     AblationConfig(
@@ -105,7 +105,7 @@ ABLATION_CONFIGS: List[AblationConfig] = [
             "throughput":        +0.5,
             "switch_penalty":    -0.1,
             "low_speed_penalty":  0.0,
-            "waiting_time":      -0.3,
+            "queue_occupancy":   -0.3,
         },
     ),
 ]

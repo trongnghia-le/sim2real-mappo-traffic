@@ -140,6 +140,7 @@ def main() -> None:
     import numpy as np
     import torch
 
+    from experiment.common.tripinfo import tripinfo_sumo_args
     from experiment.runners.train_ppo import Actor, RunningMeanStd
     from src.traffic_env.components.obs_noise import NoiseConfig
     from src.traffic_env.config import build_default_config, load_lane_groups_json
@@ -148,7 +149,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=str)
     parser.add_argument("--network", default="n3_grid",
-                        choices=["n1", "n2_corridor", "n3_grid"])
+                        choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456, 789, 1337])
     parser.add_argument("--scales", nargs="+", type=float, default=list(DEFAULT_SCALES))
     parser.add_argument("--eval-max-steps", type=int, default=1080)
@@ -185,8 +186,7 @@ def main() -> None:
         tripinfo_path = Path(tempfile.gettempdir()) / f"noise_{ckpt_path.parent.name}_{seed}.xml"
         env = MappoTrafficEnv(
             config=env_cfg, gui=False, use_libsumo=False,
-            extra_sumo_args=["--tripinfo-output", str(tripinfo_path),
-                             "--tripinfo-output.write-unfinished"],
+            extra_sumo_args=tripinfo_sumo_args(tripinfo_path),
         )
         return env, tripinfo_path
 

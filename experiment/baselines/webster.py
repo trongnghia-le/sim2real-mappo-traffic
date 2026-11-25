@@ -52,7 +52,7 @@ if str(_ROOT) not in sys.path:
 
 from src.traffic_env.config import build_default_config, load_lane_groups_json
 from src.traffic_env.envs.multi_agent import MappoTrafficEnv
-from experiment.common.tripinfo import parse_tripinfo_means
+from experiment.common.tripinfo import parse_tripinfo_means, tripinfo_sumo_args
 
 DEFAULT_PCU = {"moto": 0.3, "car": 1.0, "truck": 2.0, "bus": 2.5}
 
@@ -97,11 +97,14 @@ class WebsterPolicy:
     startup_lost: float = 2.0
     min_cycle: float = 40.0
     max_cycle: float = 120.0
-    min_green: float = 10.0
+    min_green: float = 15.0
+    max_green: float = 60.0
     max_y: float = 0.85          # Webster diverges as Y -> 1; clamp when oversaturated
     timings: Dict[str, WebsterTiming] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        if self.min_green > self.max_green:
+            raise ValueError(f"min_green ({self.min_green}) must be <= max_green ({self.max_green})")
         for tls_id, (group_a, group_b) in self.lane_groups.items():
             self.timings[tls_id] = self._fit_one(group_a, group_b)
 
@@ -127,8 +130,8 @@ class WebsterPolicy:
         cycle = float(np.clip(cycle, self.min_cycle, self.max_cycle))
 
         effective = cycle - lost
-        g_a = max(self.min_green, (y_a / big_y) * effective)
-        g_b = max(self.min_green, (y_b / big_y) * effective)
+        g_a = float(np.clip((y_a / big_y) * effective, self.min_green, self.max_green))
+        g_b = float(np.clip((y_b / big_y) * effective, self.min_green, self.max_green))
         cycle_actual = g_a + g_b + 2.0 * self.yellow
         return WebsterTiming(cycle=cycle_actual, green_a=g_a, green_b=g_b, y_a=y_a, y_b=y_b)
 
@@ -227,6 +230,8 @@ def evaluate_policy(
     seed: int,
     max_steps: int,
     tripinfo_path: Path,
+    min_green_time: int = 15,
+    max_green_time: int = 60,
 ) -> Dict[str, float]:
     env_cfg = build_default_config(
         sumo_cfg_path=str(sumo_cfg),
@@ -234,15 +239,14 @@ def evaluate_policy(
         tls_ids=tls_ids,
         manual_lane_groups=lane_groups,
         max_steps=max_steps,
+        min_green_time=min_green_time,
+        max_green_time=max_green_time,
     )
     env = MappoTrafficEnv(
         config=env_cfg,
         gui=False,
         use_libsumo=False,
-        extra_sumo_args=[
-            "--tripinfo-output", str(tripinfo_path),
-            "--tripinfo-output.write-unfinished",
-        ],
+        extra_sumo_args=tripinfo_sumo_args(tripinfo_path),
     )
     env.reset(seed=seed)
 
@@ -278,7 +282,7 @@ def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid"], default=None)
+    parser.add_argument("--network", choices=["n1", "n2_corridor", "n3_grid", "n4_irregular"], default=None)
     parser.add_argument("--split", choices=["train", "eval"], default="eval")
     parser.add_argument("--sumo-cfg", type=str, default=None)
     parser.add_argument("--lane-groups", type=str, default=None)
@@ -286,6 +290,8 @@ def main() -> None:
     parser.add_argument("--episode-steps", type=int, default=1080)
     parser.add_argument("--measure-seconds", type=int, default=5400,
                         help="measurement-pass duration (default: full episode)")
+    parser.add_argument("--min-green-time", type=int, default=15)
+    parser.add_argument("--max-green-time", type=int, default=60)
     parser.add_argument("--sat-flow", type=float, default=1800.0, help="PCU/h/lane")
     parser.add_argument("--pcu", type=str, default=None,
                         help='JSON override, e.g. \'{"moto":0.3,"car":1.0}\'')
@@ -302,7 +308,11 @@ def main() -> None:
     flows = measure_lane_flows(sumo_cfg, all_lanes, args.measure_seconds, args.seed, pcu)
 
     policy = WebsterPolicy(
-        lane_groups=lane_groups, lane_flows_pcu_h=flows, sat_flow_pcu_h=args.sat_flow,
+        lane_groups=lane_groups,
+        lane_flows_pcu_h=flows,
+        sat_flow_pcu_h=args.sat_flow,
+        min_green=float(args.min_green_time),
+        max_green=float(args.max_green_time),
     )
     print("[2/3] Webster timings (per junction, no offsets):")
     print(policy.describe())
@@ -312,6 +322,7 @@ def main() -> None:
     metrics = evaluate_policy(
         sumo_cfg, tls_ids, lane_groups, policy,
         seed=args.seed, max_steps=args.episode_steps, tripinfo_path=tripinfo_path,
+        min_green_time=args.min_green_time, max_green_time=args.max_green_time,
     )
 
     print("\n=== Webster Fixed-Time results ===")

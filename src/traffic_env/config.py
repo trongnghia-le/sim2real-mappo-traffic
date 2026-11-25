@@ -39,9 +39,9 @@ DEFAULT_LANE_FEATURE_NAMES: Tuple[str, ...] = (
 
 # W5-9 campaign: extra simulator-exact per-approach features for the
 # MAPPO-privileged upper-bound arm (paper VI-C "cost of deployability").
-# Deliberately namespaced "privileged_" so the RewardCalculator (which reads
-# e.g. "waiting_time_norm") never picks them up — the reward must stay
-# identical across the privileged and proxy arms; only the obs differs.
+# Deliberately namespaced "privileged_" so the RewardCalculator never picks
+# them up — the reward must stay identical across the privileged and proxy
+# arms; only the obs differs.
 PRIVILEGED_EXTRA_LANE_FEATURE_NAMES: Tuple[str, ...] = (
     "privileged_halt_count_norm",     # exact halted-vehicle count / queue_cap
     "privileged_waiting_norm",        # lane accumulated waiting time / waiting_cap
@@ -73,12 +73,12 @@ UPSTREAM_PHASE_FEATURE_NAMES: Tuple[str, ...] = (
 )
 
 DEFAULT_REWARD_WEIGHTS: Dict[str, float] = {
-    "queue":            -1.0,   # nonlinear (mean_q^2); primary congestion signal
-    "pressure":         -0.5,   # phase-aware imbalance (PRESSLIGHT); 0 if green_lanes absent
-    "throughput":        1.0,   # cooperative cleared-vehicles; shared across agents
+    "queue":            -1.0,   # mean of squared approach queues; primary congestion signal
+    "pressure":         -0.5,   # signed phase-aware approach imbalance (PRESSLIGHT); 0 if green_lanes absent
+    "throughput":        1.0,   # local per-agent approach-exit count
     "switch_penalty":   -0.1,   # phase-switching cost
-    "low_speed_penalty":-0.2,   # mean speed below threshold; reduce/zero for vision deploy
-    "waiting_time":     -0.3,   # accumulated delay; uses waiting_time_norm or queue proxy
+    "low_speed_penalty":-0.2,   # mean approach speed below threshold; reduce/zero for vision deploy
+    "queue_occupancy":  -0.3,   # linear mean halted-queue occupancy across approaches (legacy alias: waiting_time)
 }
 
 
@@ -209,20 +209,22 @@ class RewardConfig:
 
     weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_REWARD_WEIGHTS))
     reward_scale: float = 1.0
-    # 1.2.0 ranges with default weights: queue [-1,0], signed pressure
-    # [-0.5,+0.5], local throughput [0,+1], switch [-0.1,0], low_speed
-    # [-0.04,0], waiting [-0.3,0]  =>  raw in [-1.94, +1.50].
+    # 1.3.0 ranges with default weights: queue [-1,0], signed pressure
+    # [-0.5,+0.5], local approach throughput [0,+1], switch [-0.1,0],
+    # low_speed [-0.04,0], queue_occupancy [-0.3,0]  =>  raw in [-1.94, +1.50].
     reward_clip_low: float = -2.0
     reward_clip_high: float = 1.5
     throughput_norm_divisor: float = 20.0
     low_speed_threshold: float = 0.20
     jam_speed_threshold: float = 0.50
     jam_queue_threshold: float = 0.50
-    # ablation switches (VI-F). Defaults reproduce reward 1.2.0:
-    #   pressure_signed=True   -> signed (sum_red - sum_green)/n   (else one-sided max(.,0), pre-1.2.0 R3)
-    #   queue_mean_of_squares=True -> mean(q^2) anti-starvation     (else mean(q)^2, pre-1.2.0 R4)
+    # ablation switches (VI-F). Defaults reproduce reward 1.3.0 (approach-level):
+    #   pressure_signed=True   -> signed (sum_red - sum_green)/n_approaches (else one-sided max(.,0), pre-1.2.0 R3)
+    #   queue_mean_of_squares=True -> mean(q_a^2) anti-starvation           (else mean(q_a)^2, pre-1.2.0 R4)
+    #   privileged_reward=True -> exact per-lane halted counts + lane waiting + global arrivals (camera obs stays 26-dim)
     pressure_signed: bool = True
     queue_mean_of_squares: bool = True
+    privileged_reward: bool = False
 
     def validate(self) -> None:
         if self.reward_scale <= 0:
@@ -278,7 +280,13 @@ class TrafficEnvConfig:
     # lane-exit throughput (replaces global arrival split). Obs schema is
     # unchanged from 1.1.0; reward semantics differ, so results across
     # versions must not be pooled.
-    version: str = "1.2.0"
+    # 1.3.0: approach-level reward alignment — every reward term operates on
+    # approach aggregates (same grouping/aggregation rule as observations),
+    # throughput counts approach exits (union of lane IDs per approach edge so
+    # intra-approach lane changes are not exits), and the linear halted-queue
+    # term is documented/keyed as queue_occupancy (legacy waiting_time alias
+    # preserved for backward compatibility). Obs schema unchanged from 1.1.0.
+    version: str = "1.3.0"
 
     def validate(self) -> None:
         self.sim.validate()
@@ -441,10 +449,11 @@ def build_default_config(
     manual_lane_groups: Optional[Dict[str, Tuple[List[str], List[str]]]] = None,
     debug: bool = False,
     reward_scale: float = 1.0,
-    # --- ablation hooks (VI-F); all default to the reward-1.2.0 / schema-1.1.0 behaviour ---
+    # --- ablation hooks (VI-F); all default to the reward-1.3.0 / schema-1.3.0 behaviour ---
     reward_weights: Optional[Dict[str, float]] = None,
     pressure_signed: bool = True,
     queue_mean_of_squares: bool = True,
+    privileged_reward: bool = False,
     drop_class_shares: bool = False,
     drop_pressure_feature: bool = False,
     lane_truncated: bool = False,
@@ -462,7 +471,8 @@ def build_default_config(
     Ablation hooks (paper VI-F): ``drop_class_shares`` removes the two YOLO
     class-share features, ``drop_pressure_feature`` removes the TLS pressure
     feature, ``lane_truncated`` reproduces the pre-S1 blind-spot obs, and
-    ``pressure_signed`` / ``queue_mean_of_squares`` toggle the reward-1.2.0 fixes.
+    ``pressure_signed`` / ``queue_mean_of_squares`` toggle the signed-pressure
+    and mean-of-squares reward fixes (introduced in 1.2.0, approach-level in 1.3.0).
     ``upstream_phase_obs`` appends UPSTREAM_PHASE_FEATURE_NAMES to the TLS
     features (corridor green-wave coordination signal).
     ``lane_feature_names`` / ``tls_feature_names`` override the derived tuples
@@ -492,7 +502,8 @@ def build_default_config(
 
     reward = RewardConfig(reward_scale=reward_scale,
                           pressure_signed=pressure_signed,
-                          queue_mean_of_squares=queue_mean_of_squares)
+                          queue_mean_of_squares=queue_mean_of_squares,
+                          privileged_reward=privileged_reward)
     if reward_weights is not None:
         reward.weights = dict(reward_weights)
 

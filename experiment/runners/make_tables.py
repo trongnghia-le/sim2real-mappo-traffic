@@ -64,10 +64,13 @@ METHOD_NAMES = {
     "privileged": "MAPPO (priv.)",
     "webster": "Webster",
     "actuated": "Actuated",
-    "maxpressure": "Max-pressure",
+    "lqi": "LQI",
+    "mp": "Max-pressure",
+    "maxpressure": "LQI",  # backward compat for legacy summary.json
     "sotl": "SOTL",
     "fixed": "Fixed-time",
 }
+INSTRUMENTED_METHODS = frozenset({"actuated", "mp", "privileged"})
 
 
 def _tex_escape(s: str) -> str:
@@ -108,7 +111,7 @@ def main_table_tex(summary: dict, scenario: str) -> str:
 
     best_per_metric = {m: _best_method(aggregates, m) for m in METRIC_KEYS}
 
-    for method in methods:
+    def _emit_row(method: str) -> str:
         cells: List[str] = [_tex_escape(METHOD_NAMES.get(method, method))]
         for metric in METRIC_KEYS:
             a = aggregates[method].get(metric, {})
@@ -122,7 +125,23 @@ def main_table_tex(summary: dict, scenario: str) -> str:
             if best_per_metric.get(metric) == method:
                 txt = rf"\textbf{{{txt}}}"
             cells.append(txt)
-        lines.append(" & ".join(cells) + r" \\")
+        return " & ".join(cells) + r" \\"
+
+    camera_methods = [m for m in methods if m not in INSTRUMENTED_METHODS]
+    inst_methods = [m for m in methods if m in INSTRUMENTED_METHODS]
+    n_cols = 1 + len(METRIC_KEYS)
+
+    if camera_methods and inst_methods:
+        lines.append(rf"\multicolumn{{{n_cols}}}{{l}}{{\emph{{Camera-deployable}}}} \\")
+        for method in camera_methods:
+            lines.append(_emit_row(method))
+        lines.append(r"\midrule")
+        lines.append(rf"\multicolumn{{{n_cols}}}{{l}}{{\emph{{Instrumented references}}}} \\")
+        for method in inst_methods:
+            lines.append(_emit_row(method))
+    else:
+        for method in methods:
+            lines.append(_emit_row(method))
 
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table*}", ""]
     return "\n".join(lines)

@@ -110,6 +110,12 @@ class LaneROI:
     lane_width_px : float, optional
         Physical width of the lane in pixels.
         If None, estimated as polygon_area / lane_length_px.
+    stop_line : ((x1, y1), (x2, y2)), optional
+        Directed stop-line segment in image pixel coordinates for camera-side
+        approach-exit counting (schema 1.3.0 throughput counterpart). A track's
+        bottom-centre crosses in the exit direction when it moves from the
+        negative side to the positive side of ``(p2 - p1) x (P - p1)`` across
+        the finite segment. Swap ``(p1, p2)`` to reverse the exit direction.
     """
 
     lane_id:        str
@@ -118,6 +124,7 @@ class LaneROI:
     cam_id:         Optional[Union[int, str]] = None
     lane_length_px: Optional[float]           = None
     lane_width_px:  Optional[float]           = None
+    stop_line:      Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +205,7 @@ class StateExtractor:
         vehicle_cap:           float = 20.0,
         queue_cap:             float = 50.0,
         fps:                   float = 10.0,
+        min_track_frames:      int   = 3,
     ) -> None:
         self.tls_ids               = list(tls_ids)
         self.controlled_lanes_dict = {k: list(v) for k, v in controlled_lanes_dict.items()}
@@ -217,6 +225,14 @@ class StateExtractor:
             raise ValueError("px_per_meter must be > 0")
         if stop_speed_m_s < 0:
             raise ValueError("stop_speed_m_s must be >= 0")
+        if int(min_track_frames) < 1:
+            raise ValueError("min_track_frames must be >= 1")
+        for lane_id, roi in self.lane_rois.items():
+            if roi.stop_line is not None and len(roi.stop_line) != 2:
+                raise ValueError(
+                    f"Lane '{lane_id}' stop_line must be a 2-point segment ((x1, y1), (x2, y2))"
+                )
+        self.min_track_frames = int(min_track_frames)
         if motorbike_class_ids is not None:                            
             self._MOTORBIKE_CLASSES = frozenset(motorbike_class_ids)   
         if heavy_class_ids is not None:                              
@@ -249,6 +265,12 @@ class StateExtractor:
         # Per-camera, per-track waiting time memory
         self.track_memory: Dict[Any, Dict[int, Dict[str, float]]] = defaultdict(dict)
 
+        # Stop-line exit tracking (schema 1.3.0 camera-side throughput counterpart)
+        self._track_frame_counts:  Dict[Tuple[Any, int], int] = defaultdict(int)
+        self._stop_line_last_side: Dict[str, Dict[Tuple[Any, int], Tuple[Tuple[float, float], float]]] = defaultdict(dict)
+        self._counted_exit_tracks: Dict[str, set] = defaultdict(set)
+        self._step_exits:          Dict[str, int] = {lid: 0 for lid in self.lane_rois}
+
         self.last_lane_metrics:   Dict[str, Dict[str, float]] = {}
         self.last_accident_found: bool  = False
         self.last_accident_conf:  float = 0.0
@@ -271,11 +293,45 @@ class StateExtractor:
     def reset(self, cam_id: Optional[Union[int, str]] = None) -> None:
         if cam_id is None:
             self.track_memory.clear()
+            self._track_frame_counts.clear()
+            self._stop_line_last_side.clear()
+            self._counted_exit_tracks.clear()
+            self._step_exits = {lid: 0 for lid in self.lane_rois}
         else:
             self.track_memory.pop(cam_id, None)
+            for key in [k for k in self._track_frame_counts if self._cam_ids_match(k[0], cam_id)]:
+                self._track_frame_counts.pop(key, None)
+            for lane_id, roi in self.lane_rois.items():
+                lane_hist = self._stop_line_last_side.get(lane_id)
+                if lane_hist is not None:
+                    for key in [k for k in lane_hist if self._cam_ids_match(k[0], cam_id)]:
+                        lane_hist.pop(key, None)
+                counted = self._counted_exit_tracks.get(lane_id)
+                if counted is not None:
+                    counted.difference_update(
+                        [k for k in counted if self._cam_ids_match(k[0], cam_id)]
+                    )
+                if roi.cam_id is None or self._cam_ids_match(cam_id, roi.cam_id):
+                    self._step_exits[lane_id] = 0
         self.last_lane_metrics.clear()
         self.last_accident_found = False
         self.last_accident_conf  = 0.0
+
+    def get_step_exits(self, reset: bool = True) -> Dict[str, int]:
+        """Return per-approach stop-line exit counts for the current decision step.
+
+        Parameters
+        ----------
+        reset : bool
+            When True (default), zero the per-step accumulators for the next
+            decision step while retaining track frame counts, last positions,
+            and already-counted track IDs (each track ID is counted at most once).
+        """
+        counts = {lid: int(self._step_exits.get(lid, 0)) for lid in self.lane_rois}
+        if reset:
+            for lid in self.lane_rois:
+                self._step_exits[lid] = 0
+        return counts
 
     def build_state(
         self,
@@ -294,6 +350,7 @@ class StateExtractor:
         """
         frame_list = self._normalize_frames_input(parsed_frames)
         tracks     = self._collect_tracks(frame_list)
+        self._update_stop_line_exits(tracks)
 
         self.last_accident_found = False
         self.last_accident_conf  = 0.0
@@ -354,6 +411,7 @@ class StateExtractor:
                 "accident_found": self.last_accident_found,
                 "accident_conf":  self.last_accident_conf,
                 "lane_metrics":   self.last_lane_metrics,
+                "approach_exits": self.get_step_exits(reset=False),
             }
         return obs
 
@@ -363,11 +421,13 @@ class StateExtractor:
     ) -> Dict[str, Any]:
         frame_list = self._normalize_frames_input(parsed_frames)
         tracks     = self._collect_tracks(frame_list)
+        self._update_stop_line_exits(tracks)
 
         out: Dict[str, Any] = {
             "accident_found": False, "accident_conf": 0.0,
             "num_cameras": len(frame_list),
             "tracks_by_lane": {}, "lane_metrics": {},
+            "approach_exits": self.get_step_exits(reset=False),
         }
         for fr in frame_list:
             fd = self._as_dict(fr)
@@ -602,6 +662,109 @@ class StateExtractor:
     def _bbox_center(bbox: Sequence[float]) -> Tuple[float, float]:
         x1, y1, x2, y2 = map(float, bbox)
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @staticmethod
+    def _bbox_bottom_center(bbox: Sequence[float]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = map(float, bbox)
+        return (x1 + x2) / 2.0, max(y1, y2)
+
+    @staticmethod
+    def _cross_2d(
+        origin: Tuple[float, float],
+        a:      Tuple[float, float],
+        b:      Tuple[float, float],
+    ) -> float:
+        return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+    @classmethod
+    def _crossed_stop_line(
+        cls,
+        prev_pt:   Tuple[float, float],
+        cur_pt:    Tuple[float, float],
+        stop_line: Sequence[Sequence[float]],
+    ) -> bool:
+        """Return True iff prev_pt -> cur_pt crosses directed stop_line (p1 -> p2)
+        in the exit direction (negative to positive side of cross(p2 - p1, P - p1))
+        within the finite segment [p1, p2].
+        """
+        p1 = (float(stop_line[0][0]), float(stop_line[0][1]))
+        p2 = (float(stop_line[1][0]), float(stop_line[1][1]))
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= 1e-12:
+            return False
+
+        s_prev = cls._cross_2d(p1, p2, prev_pt)
+        s_cur  = cls._cross_2d(p1, p2, cur_pt)
+        if not (s_prev < 0.0 and s_cur > 0.0):
+            return False
+
+        t = -s_prev / (s_cur - s_prev)
+        ix = prev_pt[0] + t * (cur_pt[0] - prev_pt[0])
+        iy = prev_pt[1] + t * (cur_pt[1] - prev_pt[1])
+        u = ((ix - p1[0]) * dx + (iy - p1[1]) * dy) / seg_len_sq
+        return -1e-9 <= u <= 1.0 + 1e-9
+
+    def _update_stop_line_exits(self, tracks: List[Dict[str, Any]]) -> None:
+        """Update track ages and count directed stop-line crossings per approach ROI.
+
+        Each track ID is counted at most once per approach, requires at least
+        ``self.min_track_frames`` observed frames, and must cross the finite
+        stop-line segment in the exit direction. Tracks disappearing inside an
+        ROI without crossing are never counted as exits.
+        """
+        frame_tracks: Dict[Tuple[Any, int], Tuple[Tuple[float, float], Any]] = {}
+        for t in tracks:
+            bbox = t.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            cls_id = int(t.get("cls_id", -1))
+            if cls_id == 0:  # skip accident class
+                continue
+            track_id = t.get("track_id")
+            if track_id is None:
+                continue
+            cam_id = t.get("cam_id", "cam0")
+            key = (cam_id, int(track_id))
+            if key not in frame_tracks:
+                frame_tracks[key] = (self._bbox_bottom_center(bbox), cam_id)
+
+        for key in frame_tracks:
+            self._track_frame_counts[key] += 1
+
+        for lane_id, roi in self.lane_rois.items():
+            self._step_exits.setdefault(lane_id, 0)
+            if roi.stop_line is None:
+                continue
+
+            p1 = (float(roi.stop_line[0][0]), float(roi.stop_line[0][1]))
+            p2 = (float(roi.stop_line[1][0]), float(roi.stop_line[1][1]))
+            lane_hist = self._stop_line_last_side[lane_id]
+            counted   = self._counted_exit_tracks[lane_id]
+
+            for key, (cur_pt, cam_id) in frame_tracks.items():
+                if roi.cam_id is not None and not self._cam_ids_match(cam_id, roi.cam_id):
+                    continue
+                cur_side = self._cross_2d(p1, p2, cur_pt)
+                if abs(cur_side) <= 1e-9:
+                    # On the stop line itself: preserve last non-zero side so a
+                    # trajectory stepping through the line still registers on exit.
+                    continue
+
+                prev = lane_hist.get(key)
+                if prev is not None and key not in counted:
+                    prev_pt, prev_side = prev
+                    if (
+                        prev_side < 0.0
+                        and cur_side > 0.0
+                        and self._track_frame_counts[key] >= self.min_track_frames
+                        and self._crossed_stop_line(prev_pt, cur_pt, roi.stop_line)
+                    ):
+                        counted.add(key)
+                        self._step_exits[lane_id] += 1
+
+                lane_hist[key] = (cur_pt, cur_side)
 
     @staticmethod
     def _polygon_area(poly: Sequence[Tuple[float, float]]) -> float:
